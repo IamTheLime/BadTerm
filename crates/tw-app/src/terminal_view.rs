@@ -18,7 +18,7 @@ use tw_terminal::{
 };
 
 use crate::actions::{CloseFind, Copy, Find, FindNext, FindPrev, Paste, SelectAll};
-use crate::command::TabId;
+use crate::command::PaneId;
 use crate::theme;
 
 const PADDING: f32 = 6.0;
@@ -98,7 +98,7 @@ impl Hash for SegmentKey {
 const RECENT_IMAGES: usize = 8;
 
 pub struct TerminalView {
-    pub id: TabId,
+    pub id: PaneId,
     shell: Shell,
     focus_handle: FocusHandle,
     font: Font,
@@ -122,7 +122,7 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(id: TabId, cx: &mut Context<Self>) -> Self {
+    pub fn new(id: PaneId, cx: &mut Context<Self>) -> Self {
         let shell = match Session::spawn(PtySpec::login_shell(80, 24)) {
             Ok((session, mut output)) => {
                 cx.spawn(async move |this, cx| {
@@ -207,10 +207,8 @@ impl TerminalView {
     // --- keyboard -----------------------------------------------------------
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
-        // Ctrl-B is the tmux prefix. GPUI replays an unmatched sequence after
-        // its timeout; consume that replay instead of sending Ctrl-B to zsh.
+        // Let GPUI's multi-key workspace binding consume the prefix, but keep it out of the shell.
         if keystroke.key == "b" && keystroke.modifiers.control {
-            cx.stop_propagation();
             return;
         }
         // cmd combinations belong to the app (tabs, quit, copy), never to the shell.

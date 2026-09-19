@@ -3,6 +3,9 @@ use tw_scripting::{HostCommand, NvimState};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaneId(pub u64);
+
 /// The single way anything changes the workspace. Keyboard actions, plugin
 /// commands and (later) socket clients all convert into this and meet in
 /// `Workspace::execute`.

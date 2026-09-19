@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
+    AnyElement, Animation, AnimationExt, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Subscription, Window,
-    div, ease_out_quint, prelude::*, px, relative,
+    div, ease_out_quint, prelude::*, px,
 };
 use tw_control::{ControlEvent, ControlServer};
 use tw_scripting::{HostEvent, HostMessage, NodeHost, PluginState, PluginView, TabInfo};
@@ -19,7 +19,7 @@ use crate::actions::{
     self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MinimizeWindow, MoveTabLeft, MoveTabRight,
     NewTab, NextTab, PrevTab, ReloadPlugins, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, SplitDown, SplitRight,
 };
-use crate::command::{AppCommand, Direction, TabId};
+use crate::command::{AppCommand, Direction, PaneId, TabId};
 use crate::markdown::{self, Document};
 use crate::nvim_view::NvimPanel;
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
@@ -30,12 +30,6 @@ use crate::widgets::{self, Dispatch};
 
 const LOG_LINES: usize = 40;
 
-struct Pane {
-    id: TabId,
-    view: Entity<TerminalView>,
-    _events: Subscription,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitDirection {
     Right,
@@ -43,7 +37,7 @@ enum SplitDirection {
 }
 
 enum PaneNode {
-    Leaf(Pane),
+    Leaf(PaneId),
     Split {
         direction: SplitDirection,
         ratio: f32,
@@ -53,120 +47,145 @@ enum PaneNode {
 }
 
 impl PaneNode {
-    fn split_owned(self, active: TabId, direction: SplitDirection, new: Pane) -> (Self, bool) {
+    fn contains(&self, id: PaneId) -> bool {
         match self {
-            Self::Leaf(pane) if pane.id == active => (
-                Self::Split {
+            Self::Leaf(leaf) => *leaf == id,
+            Self::Split { first, second, .. } => first.contains(id) || second.contains(id),
+        }
+    }
+
+    fn split(&mut self, target: PaneId, direction: SplitDirection, new: PaneId) -> bool {
+        match self {
+            Self::Leaf(id) if *id == target => {
+                *self = Self::Split {
                     direction,
                     ratio: 0.5,
-                    first: Box::new(Self::Leaf(pane)),
+                    first: Box::new(Self::Leaf(target)),
                     second: Box::new(Self::Leaf(new)),
-                },
-                true,
-            ),
-            Self::Leaf(pane) => (Self::Leaf(pane), false),
-            Self::Split { direction: split_direction, ratio, first, second } => {
-                if first.contains(active) {
-                    let (first, did_split) = first.split_owned(active, direction, new);
-                    return (Self::Split { direction: split_direction, ratio, first: Box::new(first), second }, did_split);
-                }
-                if second.contains(active) {
-                    let (second, did_split) = second.split_owned(active, direction, new);
-                    return (Self::Split { direction: split_direction, ratio, first, second: Box::new(second) }, did_split);
-                }
-                (Self::Split { direction: split_direction, ratio, first, second }, false)
+                };
+                true
             }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => first.split(target, direction, new) || second.split(target, direction, new),
         }
     }
 
-    fn pane(&self, id: TabId) -> Option<&Pane> {
+    fn without(self, target: PaneId) -> (Option<Self>, bool) {
         match self {
-            Self::Leaf(pane) if pane.id == id => Some(pane),
+            Self::Leaf(id) => (if id == target { None } else { Some(Self::Leaf(id)) }, id == target),
+            Self::Split { direction, ratio, first, second } => {
+                let (first, removed) = first.without(target);
+                if removed {
+                    return (
+                        Some(match first {
+                            Some(first) => Self::Split { direction, ratio, first: Box::new(first), second },
+                            None => *second,
+                        }),
+                        true,
+                    );
+                }
+                let (second, removed) = second.without(target);
+                if removed {
+                    return (
+                        Some(match second {
+                            Some(second) => Self::Split {
+                                direction,
+                                ratio,
+                                first: Box::new(first.expect("unremoved pane tree must remain")),
+                                second: Box::new(second),
+                            },
+                            None => first.expect("unremoved pane tree must remain"),
+                        }),
+                        true,
+                    );
+                }
+                (
+                    Some(Self::Split {
+                        direction,
+                        ratio,
+                        first: Box::new(first.expect("unremoved pane tree must remain")),
+                        second: Box::new(second.expect("unremoved pane tree must remain")),
+                    }),
+                    false,
+                )
+            }
+        }
+    }
+}
+
+impl PaneNode {
+    fn first_leaf(&self) -> PaneId {
+        match self {
+            Self::Leaf(id) => *id,
+            Self::Split { first, .. } => first.first_leaf(),
+        }
+    }
+
+    fn last_leaf(&self) -> PaneId {
+        match self {
+            Self::Leaf(id) => *id,
+            Self::Split { second, .. } => second.last_leaf(),
+        }
+    }
+
+    fn focus_neighbor(&self, target: PaneId, direction: SplitDirection, toward_second: bool) -> Option<PaneId> {
+        match self {
             Self::Leaf(_) => None,
-            Self::Split { first, second, .. } => first.pane(id).or_else(|| second.pane(id)),
-        }
-    }
-
-    fn pane_ids(&self, ids: &mut Vec<TabId>) {
-        match self {
-            Self::Leaf(pane) => ids.push(pane.id),
-            Self::Split { first, second, .. } => {
-                first.pane_ids(ids);
-                second.pane_ids(ids);
+            Self::Split { direction: axis, first, second, .. } => {
+                if first.contains(target) {
+                    if *axis == direction && toward_second {
+                        first.focus_neighbor(target, direction, toward_second).or_else(|| Some(second.first_leaf()))
+                    } else {
+                        first.focus_neighbor(target, direction, toward_second)
+                    }
+                } else if second.contains(target) {
+                    if *axis == direction && !toward_second {
+                        second.focus_neighbor(target, direction, toward_second).or_else(|| Some(first.last_leaf()))
+                    } else {
+                        second.focus_neighbor(target, direction, toward_second)
+                    }
+                } else {
+                    None
+                }
             }
         }
     }
 
-    fn contains(&self, id: TabId) -> bool {
-        self.pane(id).is_some()
-    }
-
-    fn resize(&mut self, active: TabId, direction: SplitDirection, delta: f32) -> bool {
+    fn resize(&mut self, target: PaneId, direction: SplitDirection, delta: f32) -> bool {
         match self {
             Self::Leaf(_) => false,
-            Self::Split { direction: split_direction, ratio, first, second } => {
-                if *split_direction == direction {
-                    if first.contains(active) {
-                        *ratio = (*ratio + delta).clamp(0.2, 0.8);
-                        return true;
-                    }
-                    if second.contains(active) {
-                        *ratio = (*ratio - delta).clamp(0.2, 0.8);
-                        return true;
-                    }
+            Self::Split { direction: axis, ratio, first, second } => {
+                let in_first = first.contains(target);
+                let in_second = second.contains(target);
+                if !in_first && !in_second {
+                    return false;
                 }
-                first.resize(active, direction, delta) || second.resize(active, direction, delta)
+                if *axis == direction && (first.resize(target, direction, delta) || second.resize(target, direction, delta)) {
+                    return true;
+                }
+                if *axis == direction {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    true
+                } else if in_first {
+                    first.resize(target, direction, delta)
+                } else {
+                    second.resize(target, direction, delta)
+                }
             }
         }
     }
+}
 
-    fn render(&self, active: TabId) -> AnyElement {
-        match self {
-            Self::Leaf(pane) => pane.view.clone().into_any_element(),
-            Self::Split { direction, ratio, first, second } => {
-                let first_element = div()
-                    .flex_none()
-                    .size_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex_basis(relative(*ratio))
-                    .child(first.render(active));
-                let second_element = div()
-                    .flex_none()
-                    .size_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex_basis(relative(1.0 - *ratio))
-                    .child(second.render(active));
-                let container = div().flex().flex_1().min_w_0().min_h_0();
-                match direction {
-                    SplitDirection::Right => container.flex_row().child(first_element).child(second_element).into_any_element(),
-                    SplitDirection::Down => container.flex_col().child(first_element).child(second_element).into_any_element(),
-                }
-            }
-        }
-    }
+struct Pane {
+    view: Entity<TerminalView>,
+    _events: Subscription,
 }
 
 struct Tab {
     id: TabId,
-    layout: Option<PaneNode>,
-    active_pane: TabId,
-}
-
-
-impl Tab {
-    fn layout(&self) -> &PaneNode {
-        self.layout.as_ref().expect("tab always has a pane layout")
-    }
-
-    fn layout_mut(&mut self) -> &mut PaneNode {
-        self.layout.as_mut().expect("tab always has a pane layout")
-    }
-
-    fn active_view(&self) -> &Entity<TerminalView> {
-        &self.layout().pane(self.active_pane).expect("active pane belongs to its tab").view
-    }
+    root: PaneNode,
+    panes: HashMap<PaneId, Pane>,
+    active_pane: PaneId,
 }
 /// The Node process that runs the plugins is either up or explains why not.
 enum Plugins {
@@ -226,6 +245,7 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     next_tab_id: u64,
+    next_pane_id: u64,
     plugin_dir: PathBuf,
     plugins: Plugins,
     plugin_names: Vec<String>,
@@ -252,6 +272,7 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             next_tab_id: 1,
+            next_pane_id: 1,
             plugin_dir,
             plugins: Plugins::Stopped { error: "not started".to_owned() },
             plugin_names: Vec::new(),
@@ -311,7 +332,12 @@ impl Workspace {
                     None => self.tabs.get(self.active),
                 };
                 match target {
-                    Some(tab) => tab.active_view().update(cx, |view, cx| view.write(&text, cx)),
+                    Some(tab) => tab
+                        .panes
+                        .get(&tab.active_pane)
+                        .expect("active pane must belong to tab")
+                        .view
+                        .update(cx, |view, cx| view.write(&text, cx)),
                     None => self.push_log("no tab to write to".to_owned()),
                 }
             }
@@ -341,68 +367,22 @@ impl Workspace {
         }
         cx.notify();
     }
-    fn new_pane(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) -> Pane {
-        let view = cx.new(|cx| TerminalView::new(id, cx));
-        let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
-        Pane { id, view, _events: events }
-    }
-
     fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = TabId(self.next_tab_id);
+        let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
-        let pane = self.new_pane(id, window, cx);
-        self.tabs.push(Tab { id, layout: Some(PaneNode::Leaf(pane)), active_pane: id });
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let view = cx.new(|cx| TerminalView::new(pane_id, cx));
+        let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, Pane { view, _events: events });
+        self.tabs.push(Tab {
+            id: tab_id,
+            root: PaneNode::Leaf(pane_id),
+            panes,
+            active_pane: pane_id,
+        });
         self.select_tab(self.tabs.len() - 1, window, cx);
-    }
-
-    fn split_active(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.tabs.get(self.active).map(|tab| tab.active_pane) else { return };
-        let id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
-        let pane = self.new_pane(id, window, cx);
-        let tab = &mut self.tabs[self.active];
-        let layout = tab.layout.take().expect("tab always has a pane layout");
-        let (layout, did_split) = layout.split_owned(active, direction, pane);
-        tab.layout = Some(layout);
-        if did_split {
-            tab.active_pane = id;
-            self.focus_active_pane(window, cx);
-        }
-        cx.notify();
-    }
-
-    fn focus_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active) {
-            window.focus(&tab.active_view().read(cx).focus_handle(cx));
-        }
-    }
-
-    fn focus_pane(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let mut ids = Vec::new();
-        tab.layout().pane_ids(&mut ids);
-        let Some(index) = ids.iter().position(|id| *id == tab.active_pane) else { return };
-        let next = match direction {
-            Direction::Left => index.checked_sub(1),
-            Direction::Right => Some(index + 1).filter(|index| *index < ids.len()),
-        };
-        let Some(next) = next else { return };
-        tab.active_pane = ids[next];
-        self.focus_active_pane(window, cx);
-        cx.notify();
-    }
-
-    fn focus_vertical_pane(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let direction = if down { Direction::Right } else { Direction::Left };
-        self.focus_pane(direction, window, cx);
-    }
-
-    fn resize_active(&mut self, direction: SplitDirection, delta: f32, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let active = tab.active_pane;
-        if tab.layout_mut().resize(active, direction, delta) {
-            cx.notify();
-        }
     }
 
     fn on_terminal_event(
@@ -418,16 +398,14 @@ impl Workspace {
                 cx.notify();
             }
             TerminalViewEvent::Exited => {
-                let id = view.read(cx).id;
-                self.execute(AppCommand::CloseTab(id), window, cx);
+                self.close_pane(view.read(cx).id, window, cx);
             }
         }
     }
 
     fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id || tab.layout().contains(id)) else { return };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
         let before = self.tab_bounds.clone();
-        // Dropping the entity drops the session, which kills the shell.
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             cx.quit();
@@ -437,6 +415,71 @@ impl Workspace {
         let next = if index < self.active { self.active - 1 } else { self.active };
         self.select_tab(next.min(self.tabs.len() - 1), window, cx);
     }
+
+    fn close_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.panes.contains_key(&pane_id)) else { return };
+        if self.tabs[index].panes.len() == 1 {
+            let tab_id = self.tabs[index].id;
+            self.close_tab(tab_id, window, cx);
+            return;
+        }
+        let tab = &mut self.tabs[index];
+        let root = std::mem::replace(&mut tab.root, PaneNode::Leaf(pane_id));
+        let (root, removed) = root.without(pane_id);
+        if !removed {
+            unreachable!("pane registry and pane tree must agree");
+        }
+        tab.root = root.expect("closing the last pane closes the tab");
+        tab.panes.remove(&pane_id);
+        if tab.active_pane == pane_id {
+            tab.active_pane = tab.panes.keys().next().copied().expect("surviving pane must exist");
+        }
+        let active = tab.active_pane;
+        let handle = tab.panes.get(&active).expect("active pane must exist").view.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    fn split_active(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.tabs[self.active].active_pane;
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let view = cx.new(|cx| TerminalView::new(pane_id, cx));
+        let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
+        let tab = &mut self.tabs[self.active];
+        let inserted = tab.root.split(active, direction, pane_id);
+        debug_assert!(inserted);
+        tab.panes.insert(pane_id, Pane { view, _events: events });
+        tab.active_pane = pane_id;
+        let handle = tab.panes.get(&pane_id).expect("new pane must exist").view.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        if !tab.panes.contains_key(&pane_id) {
+            return;
+        }
+        tab.active_pane = pane_id;
+        let handle = tab.panes.get(&pane_id).expect("focused pane must exist").view.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    fn focus_direction(&mut self, direction: SplitDirection, toward_second: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = &self.tabs[self.active];
+        let Some(target) = tab.root.focus_neighbor(tab.active_pane, direction, toward_second) else { return };
+        self.focus_pane(target, window, cx);
+    }
+
+    fn resize_active(&mut self, direction: SplitDirection, delta: f32, cx: &mut Context<Self>) {
+        let tab = &mut self.tabs[self.active];
+        if tab.root.resize(tab.active_pane, direction, delta) {
+            cx.notify();
+        }
+    }
+
 
     /// Keeps the same tab active after the reorder.
     fn move_tab(&mut self, from: usize, to: usize) {
@@ -482,7 +525,13 @@ impl Workspace {
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(index) else { return };
         self.active = index;
-        let handle = tab.active_view().read(cx).focus_handle(cx);
+        let handle = tab
+            .panes
+            .get(&tab.active_pane)
+            .expect("active pane must belong to tab")
+            .view
+            .read(cx)
+            .focus_handle(cx);
         window.focus(&handle);
         self.tab_scroll.scroll_to_item(index);
         cx.notify();
@@ -614,7 +663,10 @@ impl Workspace {
             tabs: self
                 .tabs
                 .iter()
-                .map(|tab| TabInfo { id: tab.id.0, title: tab.active_view().read(cx).title().to_owned() })
+                .map(|tab| {
+                    let view = tab.panes.get(&tab.active_pane).expect("active pane must belong to tab").view.read(cx);
+                    TabInfo { id: tab.id.0, title: view.title().to_owned() }
+                })
                 .collect(),
         }
     }
@@ -662,7 +714,14 @@ impl Workspace {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let active = index == self.active;
             let id = tab.id;
-            let title = tab.active_view().read(cx).title().to_owned();
+            let title = tab
+                .panes
+                .get(&tab.active_pane)
+                .expect("active pane must belong to tab")
+                .view
+                .read(cx)
+                .title()
+                .to_owned();
             let dragged = DraggedTab { index, title: title.clone() };
             let close = div()
                 .id(("close-tab", index))
@@ -898,14 +957,62 @@ impl Workspace {
             .children(self.plugin_views.iter().cloned().map(|view| widgets::plugin_card(view, dispatch.clone())))
             .child(self.nvim_panel.render())
             .child(div().text_xs().text_color(theme::muted()).child("log"))
-            .children(self.log.iter().rev().take(8).map(|line| div().text_xs().text_color(theme::accent()).child(line.clone())))
+    }
+    fn render_node(&self, tab: &Tab, node: &PaneNode, _active: PaneId, cx: &mut Context<Self>) -> AnyElement {
+        match node {
+            PaneNode::Leaf(id) => {
+                let view = tab.panes.get(id).expect("pane tree and registry must agree").view.clone();
+                let pane = div()
+                    .id(("pane", id.0))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .capture_any_mouse_down(cx.listener({
+                        let id = *id;
+                        move |ws, _, window, cx| ws.focus_pane(id, window, cx)
+                    }))
+                    .child(view);
+                pane.into_any_element()
+            }
+            PaneNode::Split { direction, ratio, first, second } => {
+                let mut container = div().flex().flex_1().min_w_0().min_h_0();
+                container = match direction {
+                    SplitDirection::Right => container.flex_row(),
+                    SplitDirection::Down => container.flex_col(),
+                };
+                let first = Self::pane_slot(self.render_node(tab, first, _active, cx), *ratio);
+                let second = Self::pane_slot(self.render_node(tab, second, _active, cx), 1.0 - *ratio);
+                let divider = match direction {
+                    SplitDirection::Right => div().flex_none().w(px(1.0)).h_full().bg(theme::border()),
+                    SplitDirection::Down => div().flex_none().h(px(1.0)).w_full().bg(theme::border()),
+                };
+                container.child(first).child(divider).child(second).into_any_element()
+            }
+        }
+    }
+
+    fn pane_slot(element: AnyElement, weight: f32) -> AnyElement {
+        let mut slot = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .flex_shrink_0()
+            .flex_basis(px(0.0));
+        slot.style().flex_grow = Some(weight.max(0.01));
+        slot.child(element).into_any_element()
     }
 }
 
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let terminal = self.tabs.get(self.active).map(|tab| tab.layout().render(tab.active_pane));
+        let terminal = self
+            .tabs
+            .get(self.active)
+            .map(|tab| self.render_node(tab, &tab.root, tab.active_pane, cx));
         div()
             .key_context(actions::WORKSPACE)
             .track_focus(&self.focus_handle)
@@ -919,10 +1026,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &CloseDocument, window, cx| ws.execute(AppCommand::CloseDocument, window, cx)))
             .on_action(cx.listener(|ws, _: &SplitRight, window, cx| ws.split_active(SplitDirection::Right, window, cx)))
             .on_action(cx.listener(|ws, _: &SplitDown, window, cx| ws.split_active(SplitDirection::Down, window, cx)))
-            .on_action(cx.listener(|ws, _: &FocusLeft, window, cx| ws.focus_pane(Direction::Left, window, cx)))
-            .on_action(cx.listener(|ws, _: &FocusRight, window, cx| ws.focus_pane(Direction::Right, window, cx)))
-            .on_action(cx.listener(|ws, _: &FocusUp, window, cx| ws.focus_vertical_pane(false, window, cx)))
-            .on_action(cx.listener(|ws, _: &FocusDown, window, cx| ws.focus_vertical_pane(true, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusLeft, window, cx| ws.focus_direction(SplitDirection::Right, false, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusRight, window, cx| ws.focus_direction(SplitDirection::Right, true, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusUp, window, cx| ws.focus_direction(SplitDirection::Down, false, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusDown, window, cx| ws.focus_direction(SplitDirection::Down, true, window, cx)))
             .on_action(cx.listener(|ws, _: &ResizeLeft, _, cx| ws.resize_active(SplitDirection::Right, -0.05, cx)))
             .on_action(cx.listener(|ws, _: &ResizeRight, _, cx| ws.resize_active(SplitDirection::Right, 0.05, cx)))
             .on_action(cx.listener(|ws, _: &ResizeUp, _, cx| ws.resize_active(SplitDirection::Down, -0.05, cx)))
@@ -941,10 +1048,47 @@ impl Render for Workspace {
             .child(
                 div()
                     .flex()
+                    .flex_row()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .child(div().flex_1().min_w_0().min_h_0().children(terminal))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .children(terminal),
+                    )
                     .child(self.render_sidebar(window, cx)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PaneId, PaneNode, SplitDirection};
+
+    #[test]
+    fn split_navigation_and_resize_stay_on_the_same_axis() {
+        let mut root = PaneNode::Leaf(PaneId(1));
+        assert!(root.split(PaneId(1), SplitDirection::Right, PaneId(2)));
+        assert_eq!(root.focus_neighbor(PaneId(1), SplitDirection::Right, true), Some(PaneId(2)));
+        assert_eq!(root.focus_neighbor(PaneId(2), SplitDirection::Right, false), Some(PaneId(1)));
+        assert!(root.resize(PaneId(1), SplitDirection::Right, 0.1));
+        match root {
+            PaneNode::Split { ratio, .. } => assert!((ratio - 0.6).abs() < f32::EPSILON),
+            PaneNode::Leaf(_) => panic!("split must remain a split"),
+        }
+    }
+
+    #[test]
+    fn removing_a_pane_collapses_its_parent() {
+        let mut root = PaneNode::Leaf(PaneId(1));
+        root.split(PaneId(1), SplitDirection::Down, PaneId(2));
+        let (root, removed) = root.without(PaneId(1));
+        assert!(removed);
+        assert!(matches!(root, Some(PaneNode::Leaf(PaneId(2)))));
     }
 }

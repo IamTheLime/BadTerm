@@ -219,9 +219,12 @@ This opens a new app tab. Replace the JSON object with any `HostCommand`; see
 the `:TW json {...}` example above. The socket path must be shared by both
 processes. See [Ghostty's keybind action reference](https://ghostty.org/docs/config/keybind/reference#text).
 
-## App-local Ghostty split bindings
+## App-local terminal splits
 
-BadTerminal mirrors the tmux-style split bindings from the Ghostty config:
+BadTerminal keeps split state in the app, not in `libghostty-vt`. Each pane owns
+one PTY and one libghostty terminal session. The recursive layout uses weighted
+flex growth from a zero basis so every pane receives the full bounds of its
+slot before `Session::resize` derives the grid size.
 
 ```text
 ctrl+b v              split right
@@ -231,8 +234,8 @@ ctrl+shift+h/l        resize left/right
 ctrl+shift+k/j        resize up/down
 ```
 
-These shortcuts act inside BadTerminal. They do not create panes in the
-external Ghostty process.
+Ghostty's desktop app follows the same separation: its split tree owns layout
+and surfaces; the terminal engine only owns one terminal surface.
 
 ## Architecture
 
