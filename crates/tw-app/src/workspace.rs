@@ -9,14 +9,15 @@ use std::time::Duration;
 use futures::StreamExt;
 use gpui::{
     AnyElement, Animation, AnimationExt, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Subscription, Window,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ResizeEdge, ScrollHandle,
+    Size, Subscription, Window,
     div, ease_out_quint, prelude::*, px,
 };
 use tw_control::{ControlEvent, ControlServer};
 use tw_scripting::{HostEvent, HostMessage, NodeHost, PluginState, PluginView, TabInfo};
 
 use crate::actions::{
-    self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MinimizeWindow, MoveTabLeft, MoveTabRight,
+    self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MoveTabLeft, MoveTabRight,
     NewTab, NextTab, PrevTab, ReloadPlugins, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, SplitDown, SplitRight,
 };
 use crate::command::{AppCommand, Direction, PaneId, TabId};
@@ -30,15 +31,19 @@ use crate::widgets::{self, Dispatch};
 
 const LOG_LINES: usize = 40;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SplitId(u64);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitDirection {
     Right,
     Down,
-}
 
+}
 enum PaneNode {
     Leaf(PaneId),
     Split {
+        id: SplitId,
         direction: SplitDirection,
         ratio: f32,
         first: Box<PaneNode>,
@@ -54,10 +59,11 @@ impl PaneNode {
         }
     }
 
-    fn split(&mut self, target: PaneId, direction: SplitDirection, new: PaneId) -> bool {
+    fn split(&mut self, target: PaneId, direction: SplitDirection, new: PaneId, split_id: SplitId) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
                 *self = Self::Split {
+                    id: split_id,
                     direction,
                     ratio: 0.5,
                     first: Box::new(Self::Leaf(target)),
@@ -66,19 +72,21 @@ impl PaneNode {
                 true
             }
             Self::Leaf(_) => false,
-            Self::Split { first, second, .. } => first.split(target, direction, new) || second.split(target, direction, new),
+            Self::Split { first, second, .. } => {
+                first.split(target, direction, new, split_id) || second.split(target, direction, new, split_id)
+            }
         }
     }
 
     fn without(self, target: PaneId) -> (Option<Self>, bool) {
         match self {
             Self::Leaf(id) => (if id == target { None } else { Some(Self::Leaf(id)) }, id == target),
-            Self::Split { direction, ratio, first, second } => {
+            Self::Split { id, direction, ratio, first, second } => {
                 let (first, removed) = first.without(target);
                 if removed {
                     return (
                         Some(match first {
-                            Some(first) => Self::Split { direction, ratio, first: Box::new(first), second },
+                            Some(first) => Self::Split { id, direction, ratio, first: Box::new(first), second },
                             None => *second,
                         }),
                         true,
@@ -89,6 +97,7 @@ impl PaneNode {
                     return (
                         Some(match second {
                             Some(second) => Self::Split {
+                                id,
                                 direction,
                                 ratio,
                                 first: Box::new(first.expect("unremoved pane tree must remain")),
@@ -101,6 +110,7 @@ impl PaneNode {
                 }
                 (
                     Some(Self::Split {
+                        id,
                         direction,
                         ratio,
                         first: Box::new(first.expect("unremoved pane tree must remain")),
@@ -154,7 +164,7 @@ impl PaneNode {
     fn resize(&mut self, target: PaneId, direction: SplitDirection, delta: f32) -> bool {
         match self {
             Self::Leaf(_) => false,
-            Self::Split { direction: axis, ratio, first, second } => {
+            Self::Split { direction: axis, ratio, first, second, .. } => {
                 let in_first = first.contains(target);
                 let in_second = second.contains(target);
                 if !in_first && !in_second {
@@ -174,7 +184,21 @@ impl PaneNode {
             }
         }
     }
+    fn set_ratio(&mut self, split_id: SplitId, ratio: f32) -> bool {
+        match self {
+            Self::Leaf(_) => false,
+            Self::Split { id, ratio: current, first, second, .. } => {
+                if *id == split_id {
+                    *current = ratio.clamp(0.1, 0.9);
+                    true
+                } else {
+                    first.set_ratio(split_id, ratio) || second.set_ratio(split_id, ratio)
+                }
+            }
+        }
+    }
 }
+
 
 struct Pane {
     view: Entity<TerminalView>,
@@ -225,6 +249,32 @@ struct TabDragPreview {
     position: Point<Pixels>,
 }
 
+struct SplitDrag {
+    id: SplitId,
+    direction: SplitDirection,
+    start: Point<Pixels>,
+    ratio: f32,
+}
+
+fn resize_edge(position: Point<Pixels>, size: Size<Pixels>) -> Option<ResizeEdge> {
+    const EDGE: f32 = 8.0;
+    let left = f32::from(position.x) <= EDGE;
+    let right = f32::from(position.x) >= f32::from(size.width) - EDGE;
+    let top = f32::from(position.y) <= EDGE;
+    let bottom = f32::from(position.y) >= f32::from(size.height) - EDGE;
+    match (top, left, right, bottom) {
+        (true, true, _, _) => Some(ResizeEdge::TopLeft),
+        (true, _, true, _) => Some(ResizeEdge::TopRight),
+        (_, true, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, _, true, true) => Some(ResizeEdge::BottomRight),
+        (true, _, _, _) => Some(ResizeEdge::Top),
+        (_, _, _, true) => Some(ResizeEdge::Bottom),
+        (_, true, _, _) => Some(ResizeEdge::Left),
+        (_, _, true, _) => Some(ResizeEdge::Right),
+        _ => None,
+    }
+}
+
 impl Render for TabDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().pl(self.position.x - px(30.0)).pt(self.position.y - px(12.0)).child(
@@ -246,6 +296,7 @@ pub struct Workspace {
     active: usize,
     next_tab_id: u64,
     next_pane_id: u64,
+    next_split_id: u64,
     plugin_dir: PathBuf,
     plugins: Plugins,
     plugin_names: Vec<String>,
@@ -262,6 +313,8 @@ pub struct Workspace {
     /// Where each tab was painted last frame, measured after layout.
     tab_bounds: HashMap<TabId, Bounds<Pixels>>,
     tab_motion: TabMotion,
+    split_bounds: HashMap<SplitId, Bounds<Pixels>>,
+    split_drag: Option<SplitDrag>,
     /// Set while the title label is being dragged.
     window_drag: Option<WindowDrag>,
 }
@@ -270,6 +323,7 @@ impl Workspace {
     pub fn new(plugin_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut workspace = Self {
             tabs: Vec::new(),
+            next_split_id: 1,
             active: 0,
             next_tab_id: 1,
             next_pane_id: 1,
@@ -284,6 +338,8 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             tab_scroll: ScrollHandle::new(),
             tab_bounds: HashMap::new(),
+            split_bounds: HashMap::new(),
+            split_drag: None,
             tab_motion: TabMotion::default(),
             window_drag: None,
         };
@@ -443,11 +499,13 @@ impl Workspace {
     fn split_active(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.tabs[self.active].active_pane;
         let pane_id = PaneId(self.next_pane_id);
+        let split_id = SplitId(self.next_split_id);
+        self.next_split_id += 1;
         self.next_pane_id += 1;
         let view = cx.new(|cx| TerminalView::new(pane_id, cx));
         let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
         let tab = &mut self.tabs[self.active];
-        let inserted = tab.root.split(active, direction, pane_id);
+        let inserted = tab.root.split(active, direction, pane_id, split_id);
         debug_assert!(inserted);
         tab.panes.insert(pane_id, Pane { view, _events: events });
         tab.active_pane = pane_id;
@@ -679,7 +737,35 @@ impl Workspace {
         }
     }
 
-    fn on_drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn update_split_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.split_drag.as_ref() else { return };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let Some(bounds) = self.split_bounds.get(&drag.id).copied() else { return };
+        let span = match drag.direction {
+            SplitDirection::Right => f32::from(bounds.size.width).max(1.0),
+            SplitDirection::Down => f32::from(bounds.size.height).max(1.0),
+        };
+        let delta = match drag.direction {
+            SplitDirection::Right => f32::from(event.position.x - drag.start.x) / span,
+            SplitDirection::Down => f32::from(event.position.y - drag.start.y) / span,
+        };
+        let ratio = (drag.ratio + delta).clamp(0.1, 0.9);
+        if self.tabs[self.active].root.set_ratio(drag.id, ratio) {
+            cx.notify();
+        }
+    }
+
+    fn on_drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.split_drag.is_some() {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.update_split_drag(event, cx);
+            } else {
+                self.split_drag = None;
+            }
+            return;
+        }
         match (&self.window_drag, event.pressed_button) {
             (Some(drag), Some(MouseButton::Left)) => drag.follow_pointer(),
             (Some(_), _) => self.window_drag = None,
@@ -688,6 +774,7 @@ impl Workspace {
     }
 
     fn on_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.split_drag = None;
         self.window_drag = None;
     }
 
@@ -866,6 +953,7 @@ impl Workspace {
                     .flex_1()
                     .h_full()
                     .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::accent().opacity(0.1)))
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .on_drop(cx.listener(move |ws, tab: &DraggedTab, window, cx| {
                         ws.execute(AppCommand::MoveTab { from: tab.index, to: last }, window, cx)
                     })),
@@ -976,17 +1064,67 @@ impl Workspace {
                     .child(view);
                 pane.into_any_element()
             }
-            PaneNode::Split { direction, ratio, first, second } => {
-                let mut container = div().flex().flex_1().min_w_0().min_h_0();
+            PaneNode::Split { id: split_id, direction, ratio, first, second } => {
+                let split_id = *split_id;
+                let direction = *direction;
+                let workspace = cx.entity();
+                let mut container = div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        let (Some(first), Some(last)) = (bounds.first().copied(), bounds.last().copied()) else { return };
+                        let bounds = Bounds {
+                            origin: first.origin,
+                            size: Size {
+                                width: last.origin.x + last.size.width - first.origin.x,
+                                height: last.origin.y + last.size.height - first.origin.y,
+                            },
+                        };
+                        workspace.update(cx, |workspace, _| {
+                            workspace.split_bounds.insert(split_id, bounds);
+                        });
+                    });
                 container = match direction {
                     SplitDirection::Right => container.flex_row(),
                     SplitDirection::Down => container.flex_col(),
                 };
                 let first = Self::pane_slot(self.render_node(tab, first, _active, cx), *ratio);
                 let second = Self::pane_slot(self.render_node(tab, second, _active, cx), 1.0 - *ratio);
+                let drag_ratio = *ratio;
                 let divider = match direction {
-                    SplitDirection::Right => div().flex_none().w(px(1.0)).h_full().bg(theme::border()),
-                    SplitDirection::Down => div().flex_none().h(px(1.0)).w_full().bg(theme::border()),
+                    SplitDirection::Right => div()
+                        .id(("split-divider", split_id.0))
+                        .flex_none()
+                        .w(px(4.0))
+                        .h_full()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .bg(theme::border())
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |workspace, event: &MouseDownEvent, _, cx| {
+                            workspace.split_drag = Some(SplitDrag {
+                                id: split_id,
+                                direction,
+                                start: event.position,
+                                ratio: drag_ratio,
+                            });
+                            cx.stop_propagation();
+                        })),
+                    SplitDirection::Down => div()
+                        .id(("split-divider", split_id.0))
+                        .h(px(4.0))
+                        .w_full()
+                        .cursor(CursorStyle::ResizeUpDown)
+                        .bg(theme::border())
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |workspace, event: &MouseDownEvent, _, cx| {
+                            workspace.split_drag = Some(SplitDrag {
+                                id: split_id,
+                                direction,
+                                start: event.position,
+                                ratio: drag_ratio,
+                            });
+                            cx.stop_propagation();
+                        })),
                 };
                 container.child(first).child(divider).child(second).into_any_element()
             }
@@ -1034,7 +1172,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &ResizeRight, _, cx| ws.resize_active(SplitDirection::Right, 0.05, cx)))
             .on_action(cx.listener(|ws, _: &ResizeUp, _, cx| ws.resize_active(SplitDirection::Down, -0.05, cx)))
             .on_action(cx.listener(|ws, _: &ResizeDown, _, cx| ws.resize_active(SplitDirection::Down, 0.05, cx)))
-            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .capture_any_mouse_down(cx.listener(|_, event: &MouseDownEvent, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if let Some(edge) = resize_edge(event.position, window.bounds().size) {
+                    window.start_window_resize(edge);
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_drag_end))
@@ -1068,17 +1214,18 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneId, PaneNode, SplitDirection};
+    use super::{PaneId, PaneNode, SplitDirection, SplitId};
 
     #[test]
     fn split_navigation_and_resize_stay_on_the_same_axis() {
         let mut root = PaneNode::Leaf(PaneId(1));
-        assert!(root.split(PaneId(1), SplitDirection::Right, PaneId(2)));
+        assert!(root.split(PaneId(1), SplitDirection::Right, PaneId(2), SplitId(1)));
         assert_eq!(root.focus_neighbor(PaneId(1), SplitDirection::Right, true), Some(PaneId(2)));
         assert_eq!(root.focus_neighbor(PaneId(2), SplitDirection::Right, false), Some(PaneId(1)));
         assert!(root.resize(PaneId(1), SplitDirection::Right, 0.1));
+        assert!(root.set_ratio(SplitId(1), 0.8));
         match root {
-            PaneNode::Split { ratio, .. } => assert!((ratio - 0.6).abs() < f32::EPSILON),
+            PaneNode::Split { ratio, .. } => assert!((ratio - 0.8).abs() < f32::EPSILON),
             PaneNode::Leaf(_) => panic!("split must remain a split"),
         }
     }
@@ -1086,7 +1233,7 @@ mod tests {
     #[test]
     fn removing_a_pane_collapses_its_parent() {
         let mut root = PaneNode::Leaf(PaneId(1));
-        root.split(PaneId(1), SplitDirection::Down, PaneId(2));
+        root.split(PaneId(1), SplitDirection::Down, PaneId(2), SplitId(1));
         let (root, removed) = root.without(PaneId(1));
         assert!(removed);
         assert!(matches!(root, Some(PaneNode::Leaf(PaneId(2)))));

@@ -21,7 +21,6 @@ use crate::actions::{CloseFind, Copy, Find, FindNext, FindPrev, Paste, SelectAll
 use crate::command::PaneId;
 use crate::theme;
 
-const PADDING: f32 = 6.0;
 const MIN_UNSHAPED_GAP: usize = 3;
 const SEGMENT_CACHE_LIMIT: usize = 8192;
 
@@ -581,7 +580,7 @@ impl Render for TerminalView {
             .flex_col()
             .bg(theme::bg())
             .children(find_bar)
-            .child(div().flex_1().min_h_0().p(px(PADDING)).child(body))
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
 
