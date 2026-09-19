@@ -15,6 +15,18 @@ export interface TabInfo {
   title: string;
 }
 
+export interface NvimState {
+  pid: number;
+  cwd: string;
+  file: string;
+  line: number;
+  column: number;
+  mode: string;
+  modified: boolean;
+  lines: number;
+  lineText: string;
+}
+
 /** What the app passes to `render` and `onAction`. */
 export interface PluginState {
   activeTab: number;
@@ -28,7 +40,9 @@ export type HostCommand =
   | { type: "selectTab"; index: number }
   | { type: "log"; message: string }
   /** Show a markdown document in the sidebar, replacing the current one. */
-  | { type: "showMarkdown"; title?: string; markdown: string };
+  | { type: "showMarkdown"; title?: string; markdown: string }
+  | { type: "nvimState"; state: NvimState }
+  | { type: "nvimExited"; pid: number };
 
 /** The widget tree returned from `render`. */
 export type Widget =

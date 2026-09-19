@@ -1,0 +1,11 @@
+[package]
+name = "tw-nvim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Embedded Neovim Msgpack-RPC transport and UI redraw model"
+
+[dependencies]
+rmpv = { workspace = true }
+thiserror = { workspace = true }

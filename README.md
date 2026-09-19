@@ -126,11 +126,12 @@ the window.
 ## Neovim: hover in the sidebar
 
 `clients/nvim` is a small plugin. The active dotfiles load it at Neovim
-startup, so every `nn` session connects to the app's control socket. On each
-hover-capable LSP attach it installs a buffer-local `K` mapping that calls the
-wrapper. The wrapper calls Neovim's normal hover function, so the popup stays
-open, and sends the same hover text to the app's sidebar, rendered as markdown
-with highlighted code. It also adds `:TW` for sending anything else.
+startup. Hover commands use the app's control socket in every session; live
+buffer state is opt-in with `nn --integration`. On each hover-capable LSP
+attach it installs a buffer-local `K` mapping that calls the wrapper. The
+wrapper calls Neovim's normal hover function, so the popup stays open, and
+sends the same hover text to the app's sidebar, rendered as markdown with
+highlighted code. It also adds `:TW` for sending anything else.
 
 The active dotfiles spec is
 `~/Documents/repos/dotfiles/dotfiles/nvim/lua/plugins/terminal_workflows.lua`.
@@ -149,7 +150,8 @@ without an LSP. On another machine:
 
 Test it in three steps:
 
-0. Restart Neovim from `nn`. `:TW status` must say the app is reachable.
+0. Start the integrated session with `nn --integration`. `:TW status` must say
+   the app is reachable.
 1. Run `cargo run` here. The sidebar shows `socket · <path>`. The socket file
    disappears when the app quits, so `:TW status` reports that state.
 2. In Neovim, open any file with an LSP attached and press `K`. The popup opens
@@ -173,6 +175,36 @@ Kotlin-specific `K` in `lua/lima_the_lime/kotlin_lsp.lua` calls the server
 directly and is not mirrored; call `:TW hover` there or route it through
 `require("terminal_workflows").hover`.
 
+## Shell Neovim integration
+
+The app keeps Neovim hidden behind the existing terminal tab. Start the shell
+session with:
+
+```sh
+nn --integration
+```
+
+The `nn` wrapper sets `TW_INTEGRATION=1`. The Neovim client then sends
+buffer, cursor, mode, modified state, line count, and current-line updates to
+the BadTerminal control socket. The sidebar shows the latest state and recent
+events without replacing Neovim's normal terminal rendering.
+
+`nn` without `--integration` keeps the normal Neovim behavior. The integration
+is opt-in so existing sessions remain compatible.
+
+`crates/tw-nvim` remains a standalone low-level Msgpack-RPC and redraw probe:
+
+```sh
+cargo run -p tw-nvim --bin nvim-ui-probe
+```
+
+Build and launch the app with:
+
+```sh
+make release
+make run-release
+```
+
 ## Ghostty keybinds
 
 The app's Unix socket accepts the same JSON commands from Ghostty. Ghostty can
@@ -186,6 +218,21 @@ keybind = ctrl+shift+t=text:"printf '%s\n' '{\"type\":\"newTab\"}' | nc -U \"$TM
 This opens a new app tab. Replace the JSON object with any `HostCommand`; see
 the `:TW json {...}` example above. The socket path must be shared by both
 processes. See [Ghostty's keybind action reference](https://ghostty.org/docs/config/keybind/reference#text).
+
+## App-local Ghostty split bindings
+
+BadTerminal mirrors the tmux-style split bindings from the Ghostty config:
+
+```text
+ctrl+b v              split right
+ctrl+b h              split down
+ctrl+shift+arrows     focus adjacent pane
+ctrl+shift+h/l        resize left/right
+ctrl+shift+k/j        resize up/down
+```
+
+These shortcuts act inside BadTerminal. They do not create panes in the
+external Ghostty process.
 
 ## Architecture
 

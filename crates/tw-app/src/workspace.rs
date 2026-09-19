@@ -8,31 +8,166 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Subscription, Window, div,
-    ease_out_quint, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Subscription, Window,
+    div, ease_out_quint, prelude::*, px, relative,
 };
 use tw_control::{ControlEvent, ControlServer};
 use tw_scripting::{HostEvent, HostMessage, NodeHost, PluginState, PluginView, TabInfo};
 
 use crate::actions::{
-    self, CloseDocument, CloseTab, MinimizeWindow, MoveTabLeft, MoveTabRight, NewTab, NextTab, PrevTab, ReloadPlugins,
+    self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MinimizeWindow, MoveTabLeft, MoveTabRight,
+    NewTab, NextTab, PrevTab, ReloadPlugins, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, SplitDown, SplitRight,
 };
 use crate::command::{AppCommand, Direction, TabId};
 use crate::markdown::{self, Document};
+use crate::nvim_view::NvimPanel;
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use crate::theme;
 use crate::titlebar::WindowDrag;
 use crate::widgets::{self, Dispatch};
 
+
 const LOG_LINES: usize = 40;
 
-struct Tab {
+struct Pane {
     id: TabId,
     view: Entity<TerminalView>,
     _events: Subscription,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDirection {
+    Right,
+    Down,
+}
+
+enum PaneNode {
+    Leaf(Pane),
+    Split {
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<PaneNode>,
+        second: Box<PaneNode>,
+    },
+}
+
+impl PaneNode {
+    fn split_owned(self, active: TabId, direction: SplitDirection, new: Pane) -> (Self, bool) {
+        match self {
+            Self::Leaf(pane) if pane.id == active => (
+                Self::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(Self::Leaf(pane)),
+                    second: Box::new(Self::Leaf(new)),
+                },
+                true,
+            ),
+            Self::Leaf(pane) => (Self::Leaf(pane), false),
+            Self::Split { direction: split_direction, ratio, first, second } => {
+                if first.contains(active) {
+                    let (first, did_split) = first.split_owned(active, direction, new);
+                    return (Self::Split { direction: split_direction, ratio, first: Box::new(first), second }, did_split);
+                }
+                if second.contains(active) {
+                    let (second, did_split) = second.split_owned(active, direction, new);
+                    return (Self::Split { direction: split_direction, ratio, first, second: Box::new(second) }, did_split);
+                }
+                (Self::Split { direction: split_direction, ratio, first, second }, false)
+            }
+        }
+    }
+
+    fn pane(&self, id: TabId) -> Option<&Pane> {
+        match self {
+            Self::Leaf(pane) if pane.id == id => Some(pane),
+            Self::Leaf(_) => None,
+            Self::Split { first, second, .. } => first.pane(id).or_else(|| second.pane(id)),
+        }
+    }
+
+    fn pane_ids(&self, ids: &mut Vec<TabId>) {
+        match self {
+            Self::Leaf(pane) => ids.push(pane.id),
+            Self::Split { first, second, .. } => {
+                first.pane_ids(ids);
+                second.pane_ids(ids);
+            }
+        }
+    }
+
+    fn contains(&self, id: TabId) -> bool {
+        self.pane(id).is_some()
+    }
+
+    fn resize(&mut self, active: TabId, direction: SplitDirection, delta: f32) -> bool {
+        match self {
+            Self::Leaf(_) => false,
+            Self::Split { direction: split_direction, ratio, first, second } => {
+                if *split_direction == direction {
+                    if first.contains(active) {
+                        *ratio = (*ratio + delta).clamp(0.2, 0.8);
+                        return true;
+                    }
+                    if second.contains(active) {
+                        *ratio = (*ratio - delta).clamp(0.2, 0.8);
+                        return true;
+                    }
+                }
+                first.resize(active, direction, delta) || second.resize(active, direction, delta)
+            }
+        }
+    }
+
+    fn render(&self, active: TabId) -> AnyElement {
+        match self {
+            Self::Leaf(pane) => pane.view.clone().into_any_element(),
+            Self::Split { direction, ratio, first, second } => {
+                let first_element = div()
+                    .flex_none()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_basis(relative(*ratio))
+                    .child(first.render(active));
+                let second_element = div()
+                    .flex_none()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_basis(relative(1.0 - *ratio))
+                    .child(second.render(active));
+                let container = div().flex().flex_1().min_w_0().min_h_0();
+                match direction {
+                    SplitDirection::Right => container.flex_row().child(first_element).child(second_element).into_any_element(),
+                    SplitDirection::Down => container.flex_col().child(first_element).child(second_element).into_any_element(),
+                }
+            }
+        }
+    }
+}
+
+struct Tab {
+    id: TabId,
+    layout: Option<PaneNode>,
+    active_pane: TabId,
+}
+
+
+impl Tab {
+    fn layout(&self) -> &PaneNode {
+        self.layout.as_ref().expect("tab always has a pane layout")
+    }
+
+    fn layout_mut(&mut self) -> &mut PaneNode {
+        self.layout.as_mut().expect("tab always has a pane layout")
+    }
+
+    fn active_view(&self) -> &Entity<TerminalView> {
+        &self.layout().pane(self.active_pane).expect("active pane belongs to its tab").view
+    }
+}
 /// The Node process that runs the plugins is either up or explains why not.
 enum Plugins {
     Running(NodeHost),
@@ -97,6 +232,7 @@ pub struct Workspace {
     /// The last trees the host rendered; the sidebar draws these.
     plugin_views: Vec<PluginView>,
     control: Control,
+    nvim_panel: NvimPanel,
     /// The markdown document shown at the top of the sidebar, if any.
     document: Option<Document>,
     log: VecDeque<String>,
@@ -122,6 +258,7 @@ impl Workspace {
             plugin_views: Vec::new(),
             control: Control::Failed("not started".to_owned()),
             document: None,
+            nvim_panel: NvimPanel::default(),
             log: VecDeque::new(),
             focus_handle: cx.focus_handle(),
             tab_scroll: ScrollHandle::new(),
@@ -138,7 +275,7 @@ impl Workspace {
     /// The single dispatch point. Every producer ends up here.
     pub fn execute(&mut self, command: AppCommand, window: &mut Window, cx: &mut Context<Self>) {
         let tabs_change = matches!(
-            command,
+            &command,
             AppCommand::NewTab
                 | AppCommand::CloseTab(_)
                 | AppCommand::CloseActiveTab
@@ -174,7 +311,7 @@ impl Workspace {
                     None => self.tabs.get(self.active),
                 };
                 match target {
-                    Some(tab) => tab.view.update(cx, |view, cx| view.write(&text, cx)),
+                    Some(tab) => tab.active_view().update(cx, |view, cx| view.write(&text, cx)),
                     None => self.push_log("no tab to write to".to_owned()),
                 }
             }
@@ -196,22 +333,76 @@ impl Workspace {
                 self.document = Some(document);
             }
             AppCommand::CloseDocument => self.document = None,
+            AppCommand::NvimState(state) => self.nvim_panel.update(state),
+            AppCommand::NvimExited { pid } => self.nvim_panel.exited(pid),
         }
         if tabs_change {
             self.refresh_plugins(cx);
         }
         cx.notify();
     }
-
-    // --- tabs ----------------------------------------------------------------
+    fn new_pane(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) -> Pane {
+        let view = cx.new(|cx| TerminalView::new(id, cx));
+        let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
+        Pane { id, view, _events: events }
+    }
 
     fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
-        let view = cx.new(|cx| TerminalView::new(id, cx));
-        let events = cx.subscribe_in(&view, window, Self::on_terminal_event);
-        self.tabs.push(Tab { id, view, _events: events });
+        let pane = self.new_pane(id, window, cx);
+        self.tabs.push(Tab { id, layout: Some(PaneNode::Leaf(pane)), active_pane: id });
         self.select_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    fn split_active(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.tabs.get(self.active).map(|tab| tab.active_pane) else { return };
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let pane = self.new_pane(id, window, cx);
+        let tab = &mut self.tabs[self.active];
+        let layout = tab.layout.take().expect("tab always has a pane layout");
+        let (layout, did_split) = layout.split_owned(active, direction, pane);
+        tab.layout = Some(layout);
+        if did_split {
+            tab.active_pane = id;
+            self.focus_active_pane(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn focus_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            window.focus(&tab.active_view().read(cx).focus_handle(cx));
+        }
+    }
+
+    fn focus_pane(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let mut ids = Vec::new();
+        tab.layout().pane_ids(&mut ids);
+        let Some(index) = ids.iter().position(|id| *id == tab.active_pane) else { return };
+        let next = match direction {
+            Direction::Left => index.checked_sub(1),
+            Direction::Right => Some(index + 1).filter(|index| *index < ids.len()),
+        };
+        let Some(next) = next else { return };
+        tab.active_pane = ids[next];
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn focus_vertical_pane(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let direction = if down { Direction::Right } else { Direction::Left };
+        self.focus_pane(direction, window, cx);
+    }
+
+    fn resize_active(&mut self, direction: SplitDirection, delta: f32, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let active = tab.active_pane;
+        if tab.layout_mut().resize(active, direction, delta) {
+            cx.notify();
+        }
     }
 
     fn on_terminal_event(
@@ -234,7 +425,7 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id || tab.layout().contains(id)) else { return };
         let before = self.tab_bounds.clone();
         // Dropping the entity drops the session, which kills the shell.
         self.tabs.remove(index);
@@ -287,10 +478,11 @@ impl Workspace {
         self.tab_bounds = self.tabs.iter().zip(bounds).map(|(tab, b)| (tab.id, b)).collect();
     }
 
+
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(index) else { return };
         self.active = index;
-        let handle = tab.view.read(cx).focus_handle(cx);
+        let handle = tab.active_view().read(cx).focus_handle(cx);
         window.focus(&handle);
         self.tab_scroll.scroll_to_item(index);
         cx.notify();
@@ -422,7 +614,7 @@ impl Workspace {
             tabs: self
                 .tabs
                 .iter()
-                .map(|tab| TabInfo { id: tab.id.0, title: tab.view.read(cx).title().to_owned() })
+                .map(|tab| TabInfo { id: tab.id.0, title: tab.active_view().read(cx).title().to_owned() })
                 .collect(),
         }
     }
@@ -470,7 +662,7 @@ impl Workspace {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let active = index == self.active;
             let id = tab.id;
-            let title = tab.view.read(cx).title().to_owned();
+            let title = tab.active_view().read(cx).title().to_owned();
             let dragged = DraggedTab { index, title: title.clone() };
             let close = div()
                 .id(("close-tab", index))
@@ -555,6 +747,12 @@ impl Workspace {
             .bg(theme::titlebar())
             .border_b_1()
             .border_color(theme::border())
+            .on_mouse_down(MouseButton::Left, |event, window, cx| {
+                if event.click_count >= 2 {
+                    window.zoom_window();
+                    cx.stop_propagation();
+                }
+            })
             .child(
                 // The window's grab handle.
                 div()
@@ -619,6 +817,7 @@ impl Workspace {
                     .items_center()
                     .gap_2()
                     .child(window_button("minimize", "–", theme::warn()).on_click(|_, window, _| window.minimize_window()))
+                    .child(window_button("maximize", "□", theme::accent()).on_click(|_, window, _| window.zoom_window()))
                     .child(window_button("close", "×", theme::error()).on_click(|_, window, _| window.remove_window())),
             )
     }
@@ -697,14 +896,16 @@ impl Workspace {
             .child(div().text_xs().text_color(theme::muted()).child(format!("plugins  ·  {}", self.plugin_dir.display())))
             .child(status)
             .children(self.plugin_views.iter().cloned().map(|view| widgets::plugin_card(view, dispatch.clone())))
+            .child(self.nvim_panel.render())
             .child(div().text_xs().text_color(theme::muted()).child("log"))
             .children(self.log.iter().rev().take(8).map(|line| div().text_xs().text_color(theme::accent()).child(line.clone())))
     }
 }
 
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let terminal = self.tabs.get(self.active).map(|tab| tab.view.clone());
+        let terminal = self.tabs.get(self.active).map(|tab| tab.layout().render(tab.active_pane));
         div()
             .key_context(actions::WORKSPACE)
             .track_focus(&self.focus_handle)
@@ -716,6 +917,16 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &MoveTabLeft, window, cx| ws.execute(AppCommand::MoveActiveTab(Direction::Left), window, cx)))
             .on_action(cx.listener(|ws, _: &MoveTabRight, window, cx| ws.execute(AppCommand::MoveActiveTab(Direction::Right), window, cx)))
             .on_action(cx.listener(|ws, _: &CloseDocument, window, cx| ws.execute(AppCommand::CloseDocument, window, cx)))
+            .on_action(cx.listener(|ws, _: &SplitRight, window, cx| ws.split_active(SplitDirection::Right, window, cx)))
+            .on_action(cx.listener(|ws, _: &SplitDown, window, cx| ws.split_active(SplitDirection::Down, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusLeft, window, cx| ws.focus_pane(Direction::Left, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusRight, window, cx| ws.focus_pane(Direction::Right, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusUp, window, cx| ws.focus_vertical_pane(false, window, cx)))
+            .on_action(cx.listener(|ws, _: &FocusDown, window, cx| ws.focus_vertical_pane(true, window, cx)))
+            .on_action(cx.listener(|ws, _: &ResizeLeft, _, cx| ws.resize_active(SplitDirection::Right, -0.05, cx)))
+            .on_action(cx.listener(|ws, _: &ResizeRight, _, cx| ws.resize_active(SplitDirection::Right, 0.05, cx)))
+            .on_action(cx.listener(|ws, _: &ResizeUp, _, cx| ws.resize_active(SplitDirection::Down, -0.05, cx)))
+            .on_action(cx.listener(|ws, _: &ResizeDown, _, cx| ws.resize_active(SplitDirection::Down, 0.05, cx)))
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_move(cx.listener(Self::on_drag_move))
@@ -732,7 +943,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex_1().min_w_0().children(terminal))
+                    .child(div().flex_1().min_w_0().min_h_0().children(terminal))
                     .child(self.render_sidebar(window, cx)),
             )
     }

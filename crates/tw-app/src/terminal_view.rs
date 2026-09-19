@@ -205,9 +205,14 @@ impl TerminalView {
     }
 
     // --- keyboard -----------------------------------------------------------
-
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        // Ctrl-B is the tmux prefix. GPUI replays an unmatched sequence after
+        // its timeout; consume that replay instead of sending Ctrl-B to zsh.
+        if keystroke.key == "b" && keystroke.modifiers.control {
+            cx.stop_propagation();
+            return;
+        }
         // cmd combinations belong to the app (tabs, quit, copy), never to the shell.
         if keystroke.modifiers.platform {
             return;

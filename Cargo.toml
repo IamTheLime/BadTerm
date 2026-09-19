@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tw-terminal", "crates/tw-scripting", "crates/tw-control", "crates/tw-app"]
+members = ["crates/tw-terminal", "crates/tw-scripting", "crates/tw-control", "crates/tw-nvim", "crates/tw-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ license = "MIT"
 tw-terminal = { path = "crates/tw-terminal" }
 tw-scripting = { path = "crates/tw-scripting" }
 tw-control = { path = "crates/tw-control" }
+tw-nvim = { path = "crates/tw-nvim" }
 
 # tw-app selects the Linux window backend explicitly; gpui's defaults enable
 # X11 and require the unversioned libxkbcommon-x11 development link.
@@ -22,6 +23,7 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rquickjs = "0.13"
+rmpv = "1"
 oxc = { version = "0.150", features = ["transformer", "codegen", "semantic"] }
 notify = "8"
 thiserror = "2"

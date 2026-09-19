@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build-debug
 
-.PHONY: build-debug build-release run-debug run-release ghostty-debug ghostty-release \
+.PHONY: build-debug build-release release run-debug run-release ghostty-debug ghostty-release \
         test clippy plugins-install plugins-check check clean
 
 # Cargo's dev profile keeps symbols while .cargo/config.toml builds Ghostty as ReleaseFast.
@@ -15,6 +15,8 @@ build-debug: ghostty-debug
 
 build-release: ghostty-release
 	cargo build --workspace --locked --release
+
+release: build-release
 
 run-debug: ghostty-debug
 	cargo run --locked -p tw-app

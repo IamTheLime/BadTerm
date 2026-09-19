@@ -4,6 +4,7 @@ actions!(
     terminal_workflows,
     [
         NewTab, CloseTab, NextTab, PrevTab, MoveTabLeft, MoveTabRight, ReloadPlugins, CloseDocument, Quit, MinimizeWindow,
+        SplitRight, SplitDown, FocusLeft, FocusRight, FocusUp, FocusDown, ResizeLeft, ResizeRight, ResizeUp, ResizeDown,
         Copy, Paste, SelectAll, Find, FindNext, FindPrev, CloseFind,
     ]
 );
@@ -29,6 +30,16 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-r", ReloadPlugins, Some(WORKSPACE)),
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("ctrl-b v", SplitRight, Some(TERMINAL)),
+        KeyBinding::new("ctrl-b h", SplitDown, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-left", FocusLeft, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-right", FocusRight, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-up", FocusUp, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-down", FocusDown, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-h", ResizeLeft, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-l", ResizeRight, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-k", ResizeUp, Some(TERMINAL)),
+        KeyBinding::new("ctrl-shift-j", ResizeDown, Some(TERMINAL)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL)),
         KeyBinding::new("cmd-a", SelectAll, Some(TERMINAL)),

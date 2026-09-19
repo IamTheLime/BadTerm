@@ -10,4 +10,4 @@ mod host;
 mod protocol;
 
 pub use host::{HostError, HostEvent, NodeHost};
-pub use protocol::{HexColor, HostCommand, HostMessage, HostRequest, PluginState, PluginView, TabInfo, WidgetNode};
+pub use protocol::{HexColor, HostCommand, HostMessage, HostRequest, NvimState, PluginState, PluginView, TabInfo, WidgetNode};

@@ -1,4 +1,4 @@
-use tw_scripting::HostCommand;
+use tw_scripting::{HostCommand, NvimState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
@@ -24,6 +24,10 @@ pub enum AppCommand {
     /// Show a markdown document in the sidebar (Neovim hover, plugin docs).
     ShowDocument { title: String, markdown: String },
     CloseDocument,
+    /// Update the hidden sidebar integration card from a shell-launched Neovim.
+    NvimState(NvimState),
+    /// Mark a shell-launched Neovim session as closed.
+    NvimExited { pid: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +46,8 @@ impl From<HostCommand> for AppCommand {
             HostCommand::ShowMarkdown { title, markdown } => {
                 Self::ShowDocument { title: title.unwrap_or_else(|| "document".to_owned()), markdown }
             }
+            HostCommand::NvimState { state } => Self::NvimState(state),
+            HostCommand::NvimExited { pid } => Self::NvimExited { pid },
         }
     }
 }

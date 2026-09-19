@@ -7,6 +7,7 @@ mod terminal_view;
 mod theme;
 mod titlebar;
 mod widgets;
+mod nvim_view;
 mod workspace;
 
 use std::path::PathBuf;

@@ -21,6 +21,22 @@ pub struct TabInfo {
     pub title: String,
 }
 
+/// Live state reported by an opt-in Neovim client.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NvimState {
+    pub pid: u32,
+    pub cwd: String,
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub mode: String,
+    pub modified: bool,
+    pub lines: usize,
+    pub line_text: String,
+}
+
+
 /// What a plugin may ask the app to do. This is also the wire format the
 /// future control socket will speak, one JSON object per line.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,12 +46,16 @@ pub enum HostCommand {
     NewTab,
     SelectTab { index: usize },
     Log { message: String },
-    /// Show a markdown document in the sidebar (LSP hover from Neovim, docs from a plugin).
+    /// Show a markdown document in the sidebar (Neovim hover, plugin docs).
     ShowMarkdown {
         #[serde(default)]
         title: Option<String>,
         markdown: String,
     },
+    /// Update the hidden Neovim integration card with the shell-launched session.
+    NvimState { state: NvimState },
+    /// Mark a shell-launched Neovim session as closed.
+    NvimExited { pid: u32 },
 }
 
 /// The widget tree a plugin returns from `render()`.
@@ -187,6 +207,30 @@ mod tests {
             HostMessage::Actions {
                 id: 4,
                 commands: vec![HostCommand::WriteToTerminal { text: "ls\n".into() }, HostCommand::NewTab],
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_shell_neovim_state_commands() {
+        let command: HostCommand = serde_json::from_str(
+            r#"{"type":"nvimState","state":{"pid":42,"cwd":"/work","file":"main.rs","line":3,"column":5,"mode":"n","modified":true,"lines":10,"lineText":"fn main() {}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            HostCommand::NvimState {
+                state: NvimState {
+                    pid: 42,
+                    cwd: "/work".into(),
+                    file: "main.rs".into(),
+                    line: 3,
+                    column: 5,
+                    mode: "n".into(),
+                    modified: true,
+                    lines: 10,
+                    line_text: "fn main() {}".into(),
+                },
             }
         );
     }

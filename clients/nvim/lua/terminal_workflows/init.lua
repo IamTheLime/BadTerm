@@ -15,8 +15,10 @@ local uv = vim.uv
 
 ---@class TWConfig
 ---@field socket string|nil  Path of the app's socket; defaults to $TW_SOCKET or $TMPDIR/terminal_workflows.sock
----@field wrap_hover boolean Replace vim.lsp.buf.hover with a version that also mirrors (default true)
-M.config = { socket = nil, wrap_hover = true }
+---@field integration boolean Send live shell-Neovim state to the app (default from TW_INTEGRATION)
+M.config = { socket = nil, wrap_hover = true, integration = vim.env.TW_INTEGRATION == "1" }
+
+local last_nvim_state
 
 --- Where the app listens. `:checkhealth terminal_workflows` shows it.
 function M.socket_path()
@@ -55,6 +57,31 @@ function M.send(command)
       pipe:close()
     end)
   end)
+end
+
+--- Send the current shell-Neovim state when integration was explicitly enabled.
+function M.send_nvim_state()
+  if not M.config.integration then return end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local state = {
+    pid = vim.fn.getpid(),
+    cwd = vim.fn.getcwd(),
+    file = vim.fn.expand("%:~:."),
+    line = cursor[1],
+    column = cursor[2] + 1,
+    mode = vim.api.nvim_get_mode().mode,
+    modified = vim.bo.modified,
+    lines = vim.api.nvim_buf_line_count(0),
+    lineText = vim.api.nvim_get_current_line(),
+  }
+  local encoded = vim.json.encode(state)
+  if encoded == last_nvim_state then return end
+  last_nvim_state = encoded
+  M.send({ type = "nvimState", state = state })
+end
+
+function M.send_nvim_exit()
+  if M.config.integration then M.send({ type = "nvimExited", pid = vim.fn.getpid() }) end
 end
 
 --- Join every server's hover contents into one markdown document.
@@ -156,6 +183,27 @@ function M.setup(opts)
     })
     M.wrap_hover()
     M.map_hover(0)
+  end
+  if M.config.integration then
+    local group = vim.api.nvim_create_augroup("terminal_workflows_nvim_state", { clear = true })
+    vim.api.nvim_create_autocmd({
+      "VimEnter",
+      "BufEnter",
+      "CursorMoved",
+      "CursorMovedI",
+      "ModeChanged",
+      "TextChanged",
+      "TextChangedI",
+      "BufModifiedSet",
+    }, {
+      group = group,
+      callback = M.send_nvim_state,
+    })
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = group,
+      callback = M.send_nvim_exit,
+    })
+    vim.schedule(M.send_nvim_state)
   end
   vim.api.nvim_create_user_command("TW", function(cmd)
     local name, rest = cmd.args:match("^(%S+)%s*(.*)$")
