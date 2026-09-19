@@ -13,7 +13,9 @@ tw-terminal = { path = "crates/tw-terminal" }
 tw-scripting = { path = "crates/tw-scripting" }
 tw-control = { path = "crates/tw-control" }
 
-gpui = "0.2.2"
+# tw-app selects the Linux window backend explicitly; gpui's defaults enable
+# X11 and require the unversioned libxkbcommon-x11 development link.
+gpui = { version = "0.2.2", default-features = false }
 libghostty-vt = "0.2.1"
 portable-pty = "0.9"
 futures = "0.3"

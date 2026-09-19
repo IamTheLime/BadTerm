@@ -57,10 +57,28 @@ make run-debug
 `.envrc` sets the same PATH for direnv users. The first `cargo run` compiles
 gpui (~3 min); after that, incremental builds take seconds.
 
-On Linux, install Zig 0.15.2 with zvm and run `make build-debug` to build
-the native Ghostty crate and Rust workspace. On Fedora, install
-`libxkbcommon-x11-devel` to link the app. ZLS 0.15.1 supports Zig 0.15.x and
-is optional editor tooling; Cargo does not use it.
+On Linux, install Zig 0.15.2 with `zvm`; `scripts/build-libghostty.sh`
+automatically uses `$HOME/.zvm/0.15.2/zig` before checking `PATH`. The default
+Linux build enables gpui's Wayland backend:
+
+```bash
+make build-debug
+```
+
+`tw-app/build.rs` supplies the unversioned `libxkbcommon-x11.so` linker name
+from an installed versioned runtime library when a distribution omits the
+development symlink. If the runtime library is not installed, install the
+distribution's `libxkbcommon-x11` runtime package.
+
+For an X11 build, opt into gpui's X11 backend after building Ghostty:
+
+```bash
+make ghostty-debug
+cargo build -p tw-app --features linux-x11 --locked
+```
+
+ZLS 0.15.1 supports Zig 0.15.x and is optional editor tooling; Cargo does not
+use it.
 
 `make` defaults to `build-debug`. Use `make build-release` for a Rust release
 build, `make run-debug` or `make run-release` to launch the app, and `make check`
@@ -107,37 +125,38 @@ the window.
 
 ## Neovim: hover in the sidebar
 
-`clients/nvim` is a small plugin. It wraps `vim.lsp.buf.hover`, so your
-existing `K` mapping keeps its popup and the same hover text also appears in
-the app's sidebar, rendered as markdown with highlighted code. It also adds
-`:TW` for sending anything else.
+`clients/nvim` is a small plugin. The active dotfiles load it at Neovim
+startup, so every `nn` session connects to the app's control socket. On each
+hover-capable LSP attach it installs a buffer-local `K` mapping that calls the
+wrapper. The wrapper calls Neovim's normal hover function, so the popup stays
+open, and sends the same hover text to the app's sidebar, rendered as markdown
+with highlighted code. It also adds `:TW` for sending anything else.
 
-The dotfiles already carry the lazy.nvim spec
-(`dotfiles/nvim/lua/plugins/terminal_workflows.lua`). It points at
-`~/Documents/personal/dotfiles/terminal_workflows/clients/nvim` and only
-loads when that folder exists, so it is inert until this branch is merged
-or checked out there. On another machine:
+The active dotfiles spec is
+`~/Documents/repos/dotfiles/dotfiles/nvim/lua/plugins/terminal_workflows.lua`.
+It points at `~/Documents/repos/BadTerm/main/clients/nvim` and uses
+`lazy = false`, so it is loaded for every Neovim session, including buffers
+without an LSP. On another machine:
 
 ```lua
-{ dir = "/path/to/terminal_workflows/clients/nvim", name = "terminal_workflows",
-  event = "LspAttach", opts = {} }
+{
+  dir = "/path/to/terminal_workflows/clients/nvim",
+  name = "terminal_workflows",
+  lazy = false,
+  opts = {},
+}
 ```
 
 Test it in three steps:
 
-0. The spec must be in the config Neovim reads (`~/.config/nvim` points at
-   the `main` checkout, so on this machine a copy was placed there until the
-   branch merges). It looks in the main checkout and in `.claude/worktrees`
-   folders (a `**` glob skips hidden folders, so those are listed
-   explicitly). Restart Neovim after adding it; `:TW status` must say the
-   app is reachable and `K` is wrapped.
-1. `cargo run` here. The sidebar shows `socket · <path>`. The socket file
-   disappears when the app quits, so a `K` with the app closed only shows
-   a "Is the app running?" notice in Neovim.
-2. In Neovim (same login session, so `$TMPDIR` matches), open any file with
-   an LSP attached and press `K`. The popup opens as before and the sidebar
-   shows the same content with a `file:line  word` title.
-3. Without Neovim: `printf '{"type":"showMarkdown","title":"hi","markdown":"# Hello\n\n`code` and **bold**"}\n' | nc -U "$TMPDIR/terminal_workflows.sock"`.
+0. Restart Neovim from `nn`. `:TW status` must say the app is reachable.
+1. Run `cargo run` here. The sidebar shows `socket · <path>`. The socket file
+   disappears when the app quits, so `:TW status` reports that state.
+2. In Neovim, open any file with an LSP attached and press `K`. The popup opens
+   as before and the sidebar shows the same content with a `file:line  word`
+   title.
+3. Without Neovim:
+   `printf '{"type":"showMarkdown","title":"hi","markdown":"# Hello\n\n`code` and **bold**"}\n' | nc -U "$TMPDIR/terminal_workflows.sock"`.
    The app answers `{"type":"ok"}` per line.
 
 If nothing shows up, `:checkhealth terminal_workflows` (or `:TW status`)
@@ -147,10 +166,26 @@ hover-capable servers are attached. Plugins that replace
 
 `:TW hover` mirrors once without the popup, `:TW md README.md` shows a file,
 `:TW tab` opens a tab, `:TW send make test` types into the active shell,
-`:TW json {...}` sends a raw command. Set `TW_SOCKET` in both processes to
-use a different socket path. The Kotlin-specific `K` in
-`lua/lima_the_lime/kotlin_lsp.lua` calls the server directly and is not
-mirrored; call `:TW hover` there or route it through `require("terminal_workflows").hover`.
+`:TW json {...}` sends a raw command. Future Neovim plugins can use
+`require("terminal_workflows").send(...)` or these commands to integrate with
+the app. Set `TW_SOCKET` in both processes to use a different socket path. The
+Kotlin-specific `K` in `lua/lima_the_lime/kotlin_lsp.lua` calls the server
+directly and is not mirrored; call `:TW hover` there or route it through
+`require("terminal_workflows").hover`.
+
+## Ghostty keybinds
+
+The app's Unix socket accepts the same JSON commands from Ghostty. Ghostty can
+send one through its `text` keybind action, which types a shell command into
+the current shell:
+
+```ini
+keybind = ctrl+shift+t=text:"printf '%s\n' '{\"type\":\"newTab\"}' | nc -U \"$TMPDIR/terminal_workflows.sock\"\n"
+```
+
+This opens a new app tab. Replace the JSON object with any `HostCommand`; see
+the `:TW json {...}` example above. The socket path must be shared by both
+processes. See [Ghostty's keybind action reference](https://ghostty.org/docs/config/keybind/reference#text).
 
 ## Architecture
 
@@ -375,8 +410,9 @@ Phase 2 — window (`tw-app`)
 - [x] `Workspace` with tab strip, `cmd-t/w/1..9`, next/prev, quit.
 - [x] `TerminalView` paints on `canvas`, resizes the PTY to the element's
       bounds, forwards keys and mouse, find bar with `cmd-f`.
-- [x] Custom title strip: no native bar, hidden traffic lights, own – and ×,
-      drag to move. Tabs reorder by keyboard or drag and drop.
+- [x] Custom title strip with client-side window decorations: no compositor
+      title bar, own – and × controls, drag to move. Tabs reorder by keyboard
+      or drag and drop.
 - [x] `AppCommand` is the only way to change state; keyboard actions and
       `HostCommand` convert into it.
 
@@ -401,6 +437,10 @@ Verified so far (2026-09-17)
 - Socket: `tw-control` tests write three lines through a real Unix socket
   and get the two commands, the bad-line report and the three replies back;
   `nc -U` against the running app shows a document in the sidebar.
+- Neovim's buffer-local `K` mapping calls the hover wrapper, which keeps the
+  normal LSP popup and sends the same hover markdown to the sidebar. A
+  headless Neovim smoke test confirms the mapping is installed.
+
 - Markdown: parser tests cover code fences (highlighted into coloured runs,
   tabs expanded, blank lines kept), rules, headings, bold, inline code,
   lists and quotes.
@@ -415,9 +455,9 @@ Verified so far (2026-09-17)
   image still in the recent-texture cache. Two earlier causes of multi-second
   stalls are gone: the engine was a Zig Debug build, and every placeholder
   row re-uploaded the texture.
-- Not yet checked by hand: the look of the title strip, typing into the
-  shell, mouse selection in the live window, the find bar, drag-and-drop of
-  tabs, the Neovim `K` path end to end, and wide glyph alignment.
+- Not yet checked by hand: the look of the title strip, typing into the shell,
+  mouse selection in the live window, the find bar, drag-and-drop of tabs, the
+  Neovim LSP response path, and wide glyph alignment.
   `RUST_LOG=debug cargo run` prints grid size and PTY byte counts.
 
 Phase 4 — external control
@@ -425,18 +465,14 @@ Phase 4 — external control
       a `HostCommand`. Same enum as plugins, so nothing new to dispatch.
 - [x] Neovim client: `vim.uv` pipe, hover mirroring, `:TW hover|tab|send|md|json`.
 - [x] Markdown documents in the sidebar with highlighted code.
-- [ ] Ghostty → app: a Ghostty keybind that runs a tiny `tw` CLI which writes
-      one JSON line to the socket. Ghostty has no plugin API; a shell command
-      is the bridge. Until then: `nc -U`.
+- [x] Ghostty → app: a Ghostty `text` keybind types a shell command that
+      writes one JSON line to the socket. Ghostty has no direct socket client.
 - [ ] Events back out: `Terminal` callbacks (`on_title_changed`,
       `on_pwd_changed`, `on_bell`) become plugin events and socket lines.
 - [ ] Documents as a stack or tabs in the sidebar instead of one at a time.
 
 Phase 5 — terminal polish (later)
 - [ ] Middle-click paste, link detection and `cmd-click`.
-- [ ] Bold/italic font variants when the family has them.
-- [ ] Kitty animation frames and placements that need the placement id
-      (underline colour) to tell two placements of one image apart.
 - [ ] Split panes.
 
 ## Decisions and the facts they rest on

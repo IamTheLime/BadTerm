@@ -4,8 +4,8 @@
 --- mirrors LSP hover (`K`) into the app's sidebar, next to the usual popup.
 ---
 --- Setup with lazy.nvim:
----   { dir = "~/Documents/personal/dotfiles/terminal_workflows/clients/nvim",
----     name = "terminal_workflows", event = "LspAttach", opts = {} }
+---   { dir = "~/Documents/repos/BadTerm/main/clients/nvim",
+---     name = "terminal_workflows", lazy = false, opts = {} }
 ---
 --- Commands: `:TW hover` (mirror once), `:TW tab`, `:TW send <text>`,
 --- `:TW md <file>` (show a markdown file), `:TW json <json>` (raw command).
@@ -93,6 +93,18 @@ function M.hover(opts)
   return (M._original_hover or vim.lsp.buf.hover)(opts)
 end
 
+--- Bind Neovim's normal-mode `K` to the wrapper for this buffer.
+--- LSP creates its default `K` mapping during attach, so replacing only
+--- `vim.lsp.buf.hover` does not update the already-installed mapping.
+function M.map_hover(bufnr)
+  if #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/hover" }) == 0 then return end
+  vim.keymap.set("n", "K", M.hover, {
+    buffer = bufnr,
+    silent = true,
+    desc = "LSP hover (mirrored to terminal_workflows)",
+  })
+end
+
 --- Put the wrapper in front of whatever `vim.lsp.buf.hover` is right now.
 --- Plugins like noice replace that function when they load, so this runs
 --- again on every LspAttach and keeps their version as the one to call.
@@ -130,11 +142,20 @@ local subcommands = {
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
   if M.config.wrap_hover then
-    M.wrap_hover()
-    vim.api.nvim_create_autocmd({ "LspAttach", "VimEnter" }, {
-      group = vim.api.nvim_create_augroup("terminal_workflows_hover", { clear = true }),
+    local group = vim.api.nvim_create_augroup("terminal_workflows_hover", { clear = true })
+    vim.api.nvim_create_autocmd("LspAttach", {
+      group = group,
+      callback = function(args)
+        M.wrap_hover()
+        M.map_hover(args.buf)
+      end,
+    })
+    vim.api.nvim_create_autocmd("VimEnter", {
+      group = group,
       callback = M.wrap_hover,
     })
+    M.wrap_hover()
+    M.map_hover(0)
   end
   vim.api.nvim_create_user_command("TW", function(cmd)
     local name, rest = cmd.args:match("^(%S+)%s*(.*)$")
