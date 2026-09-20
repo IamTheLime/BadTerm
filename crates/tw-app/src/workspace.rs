@@ -17,8 +17,9 @@ use tw_control::{ControlEvent, ControlServer};
 use tw_scripting::{HostEvent, HostMessage, NodeHost, PluginState, PluginView, TabInfo};
 
 use crate::actions::{
-    self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MoveTabLeft, MoveTabRight,
-    NewTab, NextTab, PrevTab, ReloadPlugins, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, SplitDown, SplitRight,
+    self, CloseDocument, CloseTab, FocusDown, FocusLeft, FocusRight, FocusUp, MoveTabLeft, MoveTabRight, NewTab,
+    NextTab, OpenCommandPalette, PrevTab, ReloadPlugins, ResizeDown, ResizeLeft, ResizeRight, ResizeUp, SplitDown,
+    SplitRight,
 };
 use crate::command::{AppCommand, Direction, PaneId, TabId};
 use crate::markdown::{self, Document};
@@ -318,8 +319,10 @@ pub struct Workspace {
     /// Set while the title label is being dragged.
     window_drag: Option<WindowDrag>,
     settings_open: bool,
+    palette_open: bool,
     show_debug_bar: bool,
     ui_theme: theme::UiTheme,
+    context_menu: Option<Point<Pixels>>,
 }
 
 impl Workspace {
@@ -343,12 +346,15 @@ impl Workspace {
             tab_bounds: HashMap::new(),
             split_bounds: HashMap::new(),
             settings_open: false,
-            show_debug_bar: true,
+            palette_open: false,
+            show_debug_bar: false,
             ui_theme: theme::UiTheme::default(),
+            context_menu: None,
             split_drag: None,
             tab_motion: TabMotion::default(),
             window_drag: None,
         };
+        theme::set_active(workspace.ui_theme);
         workspace.start_plugins(window, cx);
         workspace.start_control(window, cx);
         workspace.execute(AppCommand::NewTab, window, cx);
@@ -518,6 +524,12 @@ impl Workspace {
         let handle = tab.panes.get(&pane_id).expect("new pane must exist").view.read(cx).focus_handle(cx);
         window.focus(&handle);
         cx.notify();
+    }
+
+    fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(pane) = tab.panes.get(&tab.active_pane) else { return };
+        window.focus(&pane.view.read(cx).focus_handle(cx));
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
@@ -787,12 +799,98 @@ impl Workspace {
     /// `cmd-1`..`cmd-9` select a tab; everything else bubbles up untouched.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if self.context_menu.is_some() && keystroke.key == "escape" {
+            self.close_context_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.palette_open && keystroke.key == "escape" {
+            self.palette_open = false;
+            self.focus_active_pane(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if keystroke.key == "p"
+            && keystroke.modifiers.shift
+            && (keystroke.modifiers.control || keystroke.modifiers.platform)
+        {
+            self.palette_open = true;
+            self.settings_open = false;
+            window.focus(&self.focus_handle);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if keystroke.key == "f8" {
+            if let Some(tab) = self.tabs.get(self.active) {
+                let active = tab.active_pane;
+                if let Some(pane) = tab.panes.get(&active) {
+                    pane.view.update(cx, |view, cx| view.toggle_pointing_hands(cx));
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
         if !keystroke.modifiers.platform {
             return;
         }
         let Some(number) = keystroke.key.parse::<usize>().ok().filter(|n| (1..=9).contains(n)) else { return };
         self.execute(AppCommand::SelectTab(number - 1), window, cx);
         cx.stop_propagation();
+    }
+    fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.settings_open = false;
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_theme(&mut self, selected: theme::UiTheme, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_theme = selected;
+        theme::set_active(selected);
+        self.palette_open = false;
+        self.settings_open = false;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+
+    fn toggle_debug_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_debug_bar = !self.show_debug_bar;
+        self.palette_open = false;
+        self.settings_open = false;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+    fn run_nvim_action(&mut self, keys: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let active = tab.active_pane;
+        if let Some(pane) = tab.panes.get(&active) {
+            pane.view.update(cx, |view, cx| view.write(keys, cx));
+        }
+        self.context_menu = None;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+    fn run_pointer_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(position) = self.context_menu else { return };
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let active = tab.active_pane;
+        if let Some(pane) = tab.panes.get(&active) {
+            pane.view.update(cx, |view, cx| view.toggle_pointing_hands_at(position, cx));
+        }
+        self.context_menu = None;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     // --- rendering ---------------------------------------------------------------
@@ -853,13 +951,7 @@ impl Workspace {
                 .on_drag(dragged, |tab: &DraggedTab, position, _, cx| {
                     let title = tab.title.clone();
                     cx.new(|_| TabDragPreview { title, position })
-                })
-                .drag_over::<DraggedTab>(|style, _, _, _| {
-                    style.bg(theme::accent().opacity(0.25)).border_l_2().border_color(theme::accent())
-                })
-                .on_drop(cx.listener(move |ws, tab: &DraggedTab, window, cx| {
-                    ws.execute(AppCommand::MoveTab { from: tab.index, to: index }, window, cx)
-                }));
+                });
             // A tab that just changed slot starts where it was and eases into place.
             match self.tab_motion.offsets.get(&id).copied() {
                 Some(slide) => element
@@ -898,12 +990,13 @@ impl Workspace {
             .bg(theme::titlebar())
             .border_b_1()
             .border_color(theme::border())
-            .on_mouse_down(MouseButton::Left, |event, window, cx| {
+            .on_mouse_down(MouseButton::Left, cx.listener(|workspace, event: &MouseDownEvent, window, cx| {
                 if event.click_count >= 2 {
                     window.zoom_window();
+                    workspace.focus_active_pane(window, cx);
                     cx.stop_propagation();
                 }
-            })
+            }))
             .child(
                 div()
                     .id("settings-button")
@@ -934,7 +1027,15 @@ impl Workspace {
                     .hover(|s| s.bg(theme::panel()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|ws, _, window, _| ws.window_drag = WindowDrag::begin(window)),
+                        cx.listener(|ws, event: &MouseDownEvent, window, cx| {
+                            if event.click_count >= 2 {
+                                window.zoom_window();
+                                ws.focus_active_pane(window, cx);
+                                cx.stop_propagation();
+                            } else {
+                                ws.window_drag = WindowDrag::begin(window);
+                            }
+                        }),
                     )
                     .child("◆ terminal_workflows"),
             )
@@ -948,6 +1049,7 @@ impl Workspace {
                     .gap_1()
                     .min_w_0()
                     .overflow_x_scroll()
+
                     .track_scroll(&self.tab_scroll)
                     .children(tabs),
             )
@@ -975,8 +1077,15 @@ impl Workspace {
                     .flex_1()
                     .h_full()
 
-                    .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::accent().opacity(0.1)))
-                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|workspace, event: &MouseDownEvent, window, cx| {
+                        if event.click_count >= 2 {
+                            window.zoom_window();
+                            workspace.focus_active_pane(window, cx);
+                            cx.stop_propagation();
+                        } else {
+                            window.start_window_move();
+                        }
+                    }))
                     .on_drop(cx.listener(move |ws, tab: &DraggedTab, window, cx| {
                         ws.execute(AppCommand::MoveTab { from: tab.index, to: last }, window, cx)
                     })),
@@ -987,7 +1096,10 @@ impl Workspace {
                     .items_center()
                     .gap_2()
                     .child(window_button("minimize", "–", theme::warn()).on_click(|_, window, _| window.minimize_window()))
-                    .child(window_button("maximize", "□", theme::accent()).on_click(|_, window, _| window.zoom_window()))
+                    .child(window_button("maximize", "□", theme::accent()).on_click(cx.listener(|workspace, _, window, cx| {
+                        window.zoom_window();
+                        workspace.focus_active_pane(window, cx);
+                    })))
                     .child(window_button("close", "×", theme::error()).on_click(|_, window, _| window.remove_window())),
             )
     }
@@ -1006,10 +1118,8 @@ impl Workspace {
             .hover(|s| s.bg(theme::raised()))
             .child(div().text_sm().text_color(theme::text()).child(self.ui_theme.label()))
             .child(div().text_xs().text_color(theme::accent()).child(if selected_theme { "●" } else { "○" }))
-            .on_click(cx.listener(|workspace, _, _, cx| {
-                workspace.ui_theme = theme::UiTheme::AyuDark;
-                workspace.settings_open = false;
-                cx.notify();
+            .on_click(cx.listener(|workspace, _, window, cx| {
+                workspace.set_theme(theme::UiTheme::AyuDark, window, cx);
             }));
         let debug_bar_item = div()
             .id("settings-debug-bar")
@@ -1023,9 +1133,8 @@ impl Workspace {
             .hover(|s| s.bg(theme::raised()))
             .child(div().text_sm().text_color(theme::text()).child("Debug bar"))
             .child(div().text_xs().text_color(theme::accent()).child(if self.show_debug_bar { "On" } else { "Off" }))
-            .on_click(cx.listener(|workspace, _, _, cx| {
-                workspace.show_debug_bar = !workspace.show_debug_bar;
-                cx.notify();
+            .on_click(cx.listener(|workspace, _, window, cx| {
+                workspace.toggle_debug_bar(window, cx);
             }));
         div()
             .id("settings-menu")
@@ -1044,6 +1153,119 @@ impl Workspace {
             .child(div().px_2().py_1().text_xs().text_color(theme::muted()).child("Settings"))
             .child(theme_item)
             .child(debug_bar_item)
+            .into_any_element()
+    }
+    fn render_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let position = self.context_menu.expect("context menu position must exist while rendered");
+        let width = 240.0;
+        let height = 230.0;
+        let x = f32::from(position.x).clamp(0.0, (f32::from(window.bounds().size.width) - width).max(0.0));
+        let y = f32::from(position.y).clamp(0.0, (f32::from(window.bounds().size.height) - height).max(0.0));
+        let item = |id: &'static str, label: &'static str, keys: &'static str, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::raised()))
+                .child(div().text_sm().text_color(theme::text()).child(label))
+                .child(div().text_xs().text_color(theme::muted()).child(keys))
+                .on_click(cx.listener(move |workspace, _, window, cx| workspace.run_nvim_action(keys, window, cx)))
+        };
+        let pointer_item = div()
+            .id("nvim-pointer-references")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::raised()))
+            .child(div().text_sm().text_color(theme::text()).child("Show pointer references"))
+            .child(div().text_xs().text_color(theme::accent()).child("F8"))
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.run_pointer_action(window, cx)));
+        div()
+            .id("nvim-context-menu")
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(div().px_3().py_2().text_xs().text_color(theme::accent()).child("Neovim"))
+            .child(div().px_3().pb_1().text_xs().text_color(theme::muted()).child("Actions are sent to the focused session"))
+            .child(pointer_item)
+            .child(item("nvim-hover", "LSP hover", "K", cx))
+            .child(item("nvim-definition", "Go to definition", "gd", cx))
+            .child(item("nvim-references", "Find references", "gr", cx))
+            .child(item("nvim-file", "Open file under cursor", "gf", cx))
+            .child(div().px_3().py_1().text_xs().text_color(theme::muted()).child("esc close"))
+            .into_any_element()
+    }
+
+    fn render_command_palette(&self, cx: &mut Context<Self>) -> AnyElement {
+        let themes = theme::UiTheme::ALL.into_iter().enumerate().map(|(index, selected)| {
+            let active = selected == self.ui_theme;
+            div()
+                .id(("palette-theme", index))
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::raised()))
+                .child(div().text_sm().text_color(theme::text()).child(selected.label()))
+                .child(div().text_xs().text_color(theme::accent()).child(if active { "●" } else { "○" }))
+                .on_click(cx.listener(move |workspace, _, window, cx| workspace.set_theme(selected, window, cx)))
+        });
+        let debug = div()
+            .id("palette-toggle-debug")
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::raised()))
+            .child(div().text_sm().text_color(theme::text()).child("Toggle debug sidebar"))
+            .child(div().text_xs().text_color(theme::accent()).child(if self.show_debug_bar { "On" } else { "Off" }))
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_debug_bar(window, cx)));
+        div()
+            .id("command-palette")
+            .absolute()
+            .top(px(theme::TITLEBAR_HEIGHT + 8.0))
+            .left(px(160.0))
+            .w(px(430.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(div().px_3().py_2().text_sm().text_color(theme::accent()).child("Command palette"))
+            .child(div().px_3().pb_1().text_xs().text_color(theme::muted()).child("Choose a theme or run a workspace command"))
+            .children(themes)
+            .child(div().h(px(1.0)).my_1().bg(theme::border()))
+            .child(debug)
+            .child(div().px_3().py_1().text_xs().text_color(theme::muted()).child("esc close"))
             .into_any_element()
     }
 
@@ -1137,7 +1359,14 @@ impl Workspace {
                     .min_h_0()
                     .capture_any_mouse_down(cx.listener({
                         let id = *id;
-                        move |ws, _, window, cx| ws.focus_pane(id, window, cx)
+                        move |ws, event: &MouseDownEvent, window, cx| {
+                            ws.focus_pane(id, window, cx);
+                            if event.button == MouseButton::Right && ws.nvim_panel.is_running() {
+                                ws.context_menu = Some(event.position);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }
                     }))
                     .child(view);
                 pane.into_any_element()
@@ -1233,6 +1462,8 @@ impl Render for Workspace {
             .get(self.active)
             .map(|tab| self.render_node(tab, &tab.root, tab.active_pane, cx));
         let settings_menu = self.settings_open.then(|| deferred(self.render_settings_menu(cx)).with_priority(10));
+        let command_palette = self.palette_open.then(|| deferred(self.render_command_palette(cx)).with_priority(20));
+        let context_menu = self.context_menu.is_some().then(|| deferred(self.render_context_menu(window, cx)).with_priority(30));
         div()
             .key_context(actions::WORKSPACE)
             .track_focus(&self.focus_handle)
@@ -1244,6 +1475,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &MoveTabLeft, window, cx| ws.execute(AppCommand::MoveActiveTab(Direction::Left), window, cx)))
             .on_action(cx.listener(|ws, _: &MoveTabRight, window, cx| ws.execute(AppCommand::MoveActiveTab(Direction::Right), window, cx)))
             .on_action(cx.listener(|ws, _: &CloseDocument, window, cx| ws.execute(AppCommand::CloseDocument, window, cx)))
+            .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(|ws, _: &SplitRight, window, cx| ws.split_active(SplitDirection::Right, window, cx)))
             .on_action(cx.listener(|ws, _: &SplitDown, window, cx| ws.split_active(SplitDirection::Down, window, cx)))
             .on_action(cx.listener(|ws, _: &FocusLeft, window, cx| ws.focus_direction(SplitDirection::Right, false, window, cx)))
@@ -1293,6 +1525,8 @@ impl Render for Workspace {
                     .children(self.show_debug_bar.then(|| self.render_sidebar(window, cx).into_any_element())),
             )
             .children(settings_menu)
+            .children(command_palette)
+            .children(context_menu)
     }
 }
 

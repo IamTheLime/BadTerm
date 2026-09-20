@@ -27,6 +27,7 @@ env_logger = { workspace = true }
 pulldown-cmark = { workspace = true }
 syntect = { workspace = true }
 image = { workspace = true }
+resvg.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Same versions gpui 0.2.2 links, to reach the NSWindow behind a gpui Window.

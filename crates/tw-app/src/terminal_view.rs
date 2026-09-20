@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-
+use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, EventEmitter, FocusHandle,
@@ -49,6 +49,10 @@ struct FindState {
     query: String,
     matches: Vec<SearchMatch>,
     current: usize,
+}
+
+struct PointingHands {
+    word: String,
 }
 
 /// A Kitty image uploaded to the GPU, valid while its generation matches.
@@ -104,12 +108,17 @@ pub struct TerminalView {
     title: String,
     layout: Option<Layout>,
     find: Option<FindState>,
+    hovered_word: Option<String>,
+    last_mouse_position: Option<Point<Pixels>>,
+    pointing: Option<PointingHands>,
+    pointing_image: Arc<RenderImage>,
     /// Kitty images by id: everything placed this frame plus a few recent ones.
     images: HashMap<u32, CachedImage>,
     /// Last shaped rows, reused when Neovim redraws the same contents.
     text_rows: Vec<CachedTextRow>,
     shaped_segments: HashMap<SegmentKey, ShapedLine>,
     frame: u64,
+    last_resize: Option<Instant>,
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -167,10 +176,15 @@ impl TerminalView {
             title: String::new(),
             layout: None,
             find: None,
+            hovered_word: None,
+            last_mouse_position: None,
+            pointing: None,
+            pointing_image: pointing_hand_image(),
             images: HashMap::new(),
             text_rows: Vec::new(),
             shaped_segments: HashMap::new(),
             frame: 0,
+            last_resize: None,
         }
     }
 
@@ -210,6 +224,14 @@ impl TerminalView {
         if keystroke.key == "b" && keystroke.modifiers.control {
             return;
         }
+        if keystroke.key == "p" && keystroke.modifiers.shift && (keystroke.modifiers.control || keystroke.modifiers.platform) {
+            return;
+        }
+        if keystroke.key == "f8" {
+            self.toggle_pointing_hands(cx);
+            cx.stop_propagation();
+            return;
+        }
         // cmd combinations belong to the app (tabs, quit, copy), never to the shell.
         if keystroke.modifiers.platform {
             return;
@@ -231,6 +253,7 @@ impl TerminalView {
             }
             return;
         }
+
         let Shell::Running(session) = &mut self.shell else { return };
         let input = KeyInput::from_name(&keystroke.key, mods_from(&keystroke.modifiers), typed_text(keystroke.key_char.as_deref()));
         if let Err(error) = session.key(&input) {
@@ -240,10 +263,37 @@ impl TerminalView {
         cx.stop_propagation();
         cx.notify();
     }
+    pub(crate) fn toggle_pointing_hands(&mut self, cx: &mut Context<Self>) {
+        let Some(word) = self.hovered_word.clone() else { return };
+        let same_word = self.pointing.as_ref().is_some_and(|pointing| pointing.word == word);
+        self.pointing = (!same_word).then_some(PointingHands { word });
+        cx.notify();
+    }
+
+    fn update_hovered_word(&mut self, position: Point<Pixels>) {
+        self.hovered_word = self.word_at_position(position);
+    }
+
+    pub(crate) fn toggle_pointing_hands_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.update_hovered_word(position);
+        self.toggle_pointing_hands(cx);
+    }
+
+    fn word_at_position(&mut self, position: Point<Pixels>) -> Option<String> {
+        let layout = self.layout?;
+        let x = f32::from(position.x - layout.bounds.origin.x);
+        let y = f32::from(position.y - layout.bounds.origin.y);
+        let col = (x / layout.cell_width).floor() as usize;
+        let row = (y / layout.line_height).floor() as usize;
+        let Shell::Running(session) = &mut self.shell else { return None };
+        let grid = session.grid(|_| ()).ok()?;
+        word_at(&grid, row, col)
+    }
 
     // --- mouse ---------------------------------------------------------------
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.last_mouse_position = Some(event.position);
         window.focus(&self.focus_handle);
         let Some(button) = button_from(event.button) else { return };
         self.send_mouse(MousePhase::Press(button), event.position, &event.modifiers, cx);
@@ -255,6 +305,8 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.last_mouse_position = Some(event.position);
+        self.update_hovered_word(event.position);
         let held = event.pressed_button.and_then(button_from);
         self.send_mouse(MousePhase::Move { held }, event.position, &event.modifiers, cx);
     }
@@ -404,10 +456,17 @@ impl TerminalView {
 
         let cols = (f32::from(bounds.size.width) / f32::from(cell_width)).floor().max(2.0) as u16;
         let rows = (f32::from(bounds.size.height) / f32::from(line_height)).floor().max(1.0) as u16;
-        match session.resize(cols, rows, f32::from(cell_width) as u16, f32::from(line_height) as u16) {
-            Ok(true) => log::debug!("tab {:?}: grid {cols}x{rows}, cell {cell_width:?}x{line_height:?}", self.id),
-            Ok(false) => {}
-            Err(error) => log::warn!("resize: {error}"),
+        // Window drags can produce a stream of dimensions. Do not synchronously
+        // reflow Ghostty and resize the PTY for every intermediate frame.
+        let now = Instant::now();
+        let resize_allowed = self.last_resize.map_or(true, |last| now.duration_since(last) >= Duration::from_millis(50));
+        if resize_allowed {
+            match session.resize(cols, rows, f32::from(cell_width) as u16, f32::from(line_height) as u16) {
+                Ok(true) => log::debug!("tab {:?}: grid {cols}x{rows}, cell {cell_width:?}x{line_height:?}", self.id),
+                Ok(false) => {}
+                Err(error) => log::warn!("resize: {error}"),
+            }
+            self.last_resize = Some(now);
         }
 
         let started = std::time::Instant::now();
@@ -427,8 +486,15 @@ impl TerminalView {
             line_height,
             &mut self.text_rows,
             &mut self.shaped_segments,
+            self.pointing_image.clone(),
             window,
         );
+        plan.cell_width = cell_width;
+        plan.pointing = self
+            .pointing
+            .as_ref()
+            .map(|pointing| visible_word_matches(&grid, &pointing.word))
+            .unwrap_or_default();
         let plan_took = started.elapsed() - grid_took;
         if grid_took.as_millis() + plan_took.as_millis() >= 10 {
             log::debug!(
@@ -593,6 +659,62 @@ fn typed_text(key_char: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn row_chars<C>(row: &Row<C>) -> Vec<char> {
+    let mut chars = Vec::new();
+    for cell in &row.cells {
+        match &cell.content {
+            CellContent::Blank => chars.push(' '),
+            CellContent::Text(text) => chars.extend(text.chars()),
+        }
+    }
+    chars
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn word_at_chars(chars: &[char], col: usize) -> Option<String> {
+    if col >= chars.len() || !is_word_char(chars[col]) {
+        return None;
+    }
+    let start = (0..=col).rev().find(|&index| index == 0 || !is_word_char(chars[index - 1]))?;
+    let end = (col..chars.len()).find(|&index| !is_word_char(chars[index])).unwrap_or(chars.len());
+    Some(chars[start..end].iter().collect())
+}
+
+fn word_at<C>(grid: &Grid<C>, row: usize, col: usize) -> Option<String> {
+    grid.rows.get(row).map(row_chars).and_then(|chars| word_at_chars(&chars, col))
+}
+
+fn word_matches_in_chars(chars: &[char], word: &str, row: u32) -> Vec<SearchMatch> {
+    let needle: Vec<char> = word.chars().collect();
+    if needle.is_empty() || chars.len() < needle.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for col in 0..=chars.len() - needle.len() {
+        if chars[col..col + needle.len()] != needle[..] {
+            continue;
+        }
+        let left_boundary = col == 0 || !is_word_char(chars[col - 1]);
+        let right = col + needle.len();
+        let right_boundary = right == chars.len() || !is_word_char(chars[right]);
+        if left_boundary && right_boundary {
+            matches.push(SearchMatch { row, col: col as u16, len: needle.len() as u16 });
+        }
+    }
+    matches
+}
+
+fn visible_word_matches<C>(grid: &Grid<C>, word: &str) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    for (row_index, row) in grid.rows.iter().enumerate() {
+        matches.extend(word_matches_in_chars(&row_chars(row), word, row_index as u32));
+    }
+    matches
+}
+
 fn mods_from(modifiers: &Modifiers) -> Mods {
     let mut mods = Mods::empty();
     if modifiers.shift {
@@ -610,6 +732,31 @@ fn mods_from(modifiers: &Modifiers) -> Mods {
     mods
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{word_at_chars, word_matches_in_chars};
+
+    #[test]
+    fn hovered_word_uses_identifier_boundaries() {
+        let chars: Vec<char> = "  nvim_point word42  ".chars().collect();
+        assert_eq!(word_at_chars(&chars, 4).as_deref(), Some("nvim_point"));
+        assert_eq!(word_at_chars(&chars, 16).as_deref(), Some("word42"));
+        assert_eq!(word_at_chars(&chars, 0), None);
+    }
+
+    #[test]
+    fn pointing_matches_skip_substrings() {
+        let chars: Vec<char> = "word sword word".chars().collect();
+        assert_eq!(
+            word_matches_in_chars(&chars, "word", 3),
+            vec![
+                tw_terminal::SearchMatch { row: 3, col: 0, len: 4 },
+                tw_terminal::SearchMatch { row: 3, col: 11, len: 4 },
+            ]
+        );
+    }
+}
+
 /// gpui's buttons are an open set (it also has navigation buttons); only these three matter here.
 fn button_from(button: gpui::MouseButton) -> Option<MouseButton> {
     match button {
@@ -623,11 +770,14 @@ fn button_from(button: gpui::MouseButton) -> Option<MouseButton> {
 /// Everything paint needs, computed in prepaint where `self` is available.
 struct PaintPlan {
     line_height: Pixels,
+    cell_width: Pixels,
     background: Hsla,
     quads: Vec<(Bounds<Pixels>, Hsla)>,
     segments: Vec<Segment>,
     cursor: Option<CursorPaint>,
     images: Vec<ImagePaint>,
+    pointing: Vec<SearchMatch>,
+    pointing_image: Arc<RenderImage>,
 }
 
 /// One placed Kitty image. gpui paints whole images, so the full image is
@@ -751,6 +901,7 @@ impl PaintPlan {
         line_height: Pixels,
         text_rows: &mut Vec<CachedTextRow>,
         shaped_segments: &mut HashMap<SegmentKey, ShapedLine>,
+        pointing_image: Arc<RenderImage>,
         window: &Window,
     ) -> Self {
         let mut quads = Vec::new();
@@ -883,7 +1034,17 @@ impl PaintPlan {
             }
         });
 
-        Self { line_height, background: grid.background, quads, segments, cursor, images: Vec::new() }
+        Self {
+            line_height,
+            cell_width,
+            background: grid.background,
+            quads,
+            segments,
+            cursor,
+            images: Vec::new(),
+            pointing: Vec::new(),
+            pointing_image,
+        }
     }
 
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -915,11 +1076,68 @@ impl PaintPlan {
             }
         }
         paint_images(ImageLayer::AboveText, window);
+        for found in &self.pointing {
+            paint_pointing_hand(window, bounds, origin, self.cell_width, self.line_height, *found, self.pointing_image.clone());
+        }
         if let Some(CursorPaint::Hollow(b, color)) = &self.cursor {
             window.paint_quad(outline(place(*b), *color, BorderStyle::Solid));
         }
     }
 }
+
+fn paint_pointing_hand(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    canvas_origin: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    found: SearchMatch,
+    image: Arc<RenderImage>,
+) {
+    let scale = (f32::from(line_height) / 20.0).clamp(0.65, 1.5);
+    let width = 40.0 * scale;
+    let height = width;
+    let word_x = f32::from(cell_width) * f32::from(found.col);
+    let tip_x = word_x + f32::from(cell_width) * 0.5;
+    let max_x = (f32::from(bounds.size.width) - width).max(0.0);
+    let x = (tip_x - width * 21.0 / 24.0).clamp(0.0, max_x);
+    let row_y = f32::from(line_height) * found.row as f32;
+    let max_y = (f32::from(bounds.size.height) - height).max(0.0);
+    let y = (row_y + f32::from(line_height) * 0.65 - height * 21.0 / 24.0).clamp(0.0, max_y);
+    let image_bounds = Bounds {
+        origin: point(canvas_origin.x + px(x), canvas_origin.y + px(y)),
+        size: size(px(width), px(height)),
+    };
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        if let Err(error) = window.paint_image(image_bounds, Corners::default(), image, 0, false) {
+            log::warn!("paint pointer image: {error}");
+        }
+    });
+}
+/// The pointer asset supplied for the references overlay.
+const POINTER_SVG: &[u8] = br##"<?xml version="1.0" encoding="utf-8"?>
+<!-- License: MIT. Made by basicons: https://basicons.xyz/ -->
+<svg width="800px" height="800px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M22 10.2069L3 3L10.2069 22L13.4828 13.4828L22 10.2069Z" transform="rotate(180 12 12)" fill="#ffffff" stroke="#000000" stroke-width="0.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"##;
+
+fn pointing_hand_image() -> Arc<RenderImage> {
+    let tree = resvg::usvg::Tree::from_data(POINTER_SVG, &resvg::usvg::Options::default())
+        .expect("the embedded pointer SVG must parse");
+    let source_size = tree.size();
+    let scale = 96.0 / source_size.width().max(source_size.height());
+    let width = (source_size.width() * scale).ceil() as u32;
+    let height = (source_size.height() * scale).ceil() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).expect("the pointer SVG must have a valid size");
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let mut image = image::RgbaImage::from_raw(width, height, pixmap.take())
+        .expect("the pointer SVG dimensions must match its pixel buffer");
+    for pixel in image.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(image)]))
+}
+
 
 fn text_run(len: usize, attrs: Attrs, color: Hsla, base: &Font) -> TextRun {
     let underline = match attrs.underline {

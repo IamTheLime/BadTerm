@@ -5,7 +5,7 @@ actions!(
     [
         NewTab, CloseTab, NextTab, PrevTab, MoveTabLeft, MoveTabRight, ReloadPlugins, CloseDocument, Quit, MinimizeWindow,
         SplitRight, SplitDown, FocusLeft, FocusRight, FocusUp, FocusDown, ResizeLeft, ResizeRight, ResizeUp, ResizeDown,
-        Copy, Paste, SelectAll, Find, FindNext, FindPrev, CloseFind,
+        Copy, Paste, SelectAll, Find, FindNext, FindPrev, CloseFind, OpenCommandPalette,
     ]
 );
 
@@ -43,7 +43,8 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL)),
         KeyBinding::new("cmd-a", SelectAll, Some(TERMINAL)),
-        KeyBinding::new("cmd-f", Find, Some(TERMINAL)),
+        KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some(WORKSPACE)),
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some(WORKSPACE)),
         KeyBinding::new("enter", FindNext, Some(FIND)),
         KeyBinding::new("cmd-g", FindNext, Some(FIND)),
         KeyBinding::new("shift-enter", FindPrev, Some(FIND)),

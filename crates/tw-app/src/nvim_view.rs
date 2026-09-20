@@ -39,6 +39,9 @@ impl NvimPanel {
         self.state = NvimSessionState::Running { pid: state.pid };
         self.push_event(event);
     }
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, NvimSessionState::Running { .. })
+    }
 
     pub fn exited(&mut self, pid: u32) {
         if self.snapshot.as_ref().is_some_and(|state| state.pid == pid) {

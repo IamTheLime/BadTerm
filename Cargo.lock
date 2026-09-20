@@ -6128,6 +6128,7 @@ dependencies = [
  "objc",
  "pulldown-cmark",
  "raw-window-handle",
+ "resvg",
  "syntect",
  "tw-control",
  "tw-scripting",
