@@ -11,7 +11,7 @@ use gpui::{
     AnyElement, Animation, AnimationExt, App, Bounds, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ResizeEdge, ScrollHandle,
     Size, Subscription, Window,
-    div, ease_out_quint, prelude::*, px,
+    div, ease_out_quint, deferred, prelude::*, px,
 };
 use tw_control::{ControlEvent, ControlServer};
 use tw_scripting::{HostEvent, HostMessage, NodeHost, PluginState, PluginView, TabInfo};
@@ -317,6 +317,9 @@ pub struct Workspace {
     split_drag: Option<SplitDrag>,
     /// Set while the title label is being dragged.
     window_drag: Option<WindowDrag>,
+    settings_open: bool,
+    show_debug_bar: bool,
+    ui_theme: theme::UiTheme,
 }
 
 impl Workspace {
@@ -339,6 +342,9 @@ impl Workspace {
             tab_scroll: ScrollHandle::new(),
             tab_bounds: HashMap::new(),
             split_bounds: HashMap::new(),
+            settings_open: false,
+            show_debug_bar: true,
+            ui_theme: theme::UiTheme::default(),
             split_drag: None,
             tab_motion: TabMotion::default(),
             window_drag: None,
@@ -791,10 +797,9 @@ impl Workspace {
 
     // --- rendering ---------------------------------------------------------------
 
-    /// The strip where macOS would draw the title: brand, tabs, and our own
-    /// minimize/close buttons. Only the title label moves the window (by
-    /// hand, see `titlebar.rs`); dragging a tab reorders it; the tab list
-    /// scrolls sideways when it overflows.
+    /// The strip where macOS would draw the title: settings, brand, tabs, and
+    /// our own minimize/close buttons. The brand and empty space move the
+    /// window; dragging a tab reorders it.
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let last = self.tabs.len().saturating_sub(1);
         let generation = self.tab_motion.generation;
@@ -900,6 +905,23 @@ impl Workspace {
                 }
             })
             .child(
+                div()
+                    .id("settings-button")
+                    .size(px(24.0))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_color(theme::muted())
+                    .hover(|s| s.bg(theme::panel()).text_color(theme::text()))
+                    .child("☰")
+                    .on_click(cx.listener(|workspace, _, _, cx| {
+                        workspace.settings_open = !workspace.settings_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
                 // The window's grab handle.
                 div()
                     .id("brand")
@@ -952,6 +974,7 @@ impl Workspace {
                     .id("titlebar-space")
                     .flex_1()
                     .h_full()
+
                     .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::accent().opacity(0.1)))
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .on_drop(cx.listener(move |ws, tab: &DraggedTab, window, cx| {
@@ -967,6 +990,61 @@ impl Workspace {
                     .child(window_button("maximize", "□", theme::accent()).on_click(|_, window, _| window.zoom_window()))
                     .child(window_button("close", "×", theme::error()).on_click(|_, window, _| window.remove_window())),
             )
+    }
+
+    fn render_settings_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected_theme = self.ui_theme == theme::UiTheme::AyuDark;
+        let theme_item = div()
+            .id("settings-theme-ayu-dark")
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::raised()))
+            .child(div().text_sm().text_color(theme::text()).child(self.ui_theme.label()))
+            .child(div().text_xs().text_color(theme::accent()).child(if selected_theme { "●" } else { "○" }))
+            .on_click(cx.listener(|workspace, _, _, cx| {
+                workspace.ui_theme = theme::UiTheme::AyuDark;
+                workspace.settings_open = false;
+                cx.notify();
+            }));
+        let debug_bar_item = div()
+            .id("settings-debug-bar")
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::raised()))
+            .child(div().text_sm().text_color(theme::text()).child("Debug bar"))
+            .child(div().text_xs().text_color(theme::accent()).child(if self.show_debug_bar { "On" } else { "Off" }))
+            .on_click(cx.listener(|workspace, _, _, cx| {
+                workspace.show_debug_bar = !workspace.show_debug_bar;
+                cx.notify();
+            }));
+        div()
+            .id("settings-menu")
+            .absolute()
+            .top(px(theme::TITLEBAR_HEIGHT))
+            .left(px(8.0))
+            .w(px(220.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(div().px_2().py_1().text_xs().text_color(theme::muted()).child("Settings"))
+            .child(theme_item)
+            .child(debug_bar_item)
+            .into_any_element()
     }
 
     fn render_document(&self, document: &Document, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1097,10 +1175,11 @@ impl Workspace {
                     SplitDirection::Right => div()
                         .id(("split-divider", split_id.0))
                         .flex_none()
-                        .w(px(4.0))
+                        .w(px(1.0))
                         .h_full()
                         .cursor(CursorStyle::ResizeLeftRight)
                         .bg(theme::border())
+                        .opacity(0.8)
                         .on_mouse_down(MouseButton::Left, cx.listener(move |workspace, event: &MouseDownEvent, _, cx| {
                             workspace.split_drag = Some(SplitDrag {
                                 id: split_id,
@@ -1112,10 +1191,12 @@ impl Workspace {
                         })),
                     SplitDirection::Down => div()
                         .id(("split-divider", split_id.0))
-                        .h(px(4.0))
+                        .flex_none()
+                        .h(px(1.0))
                         .w_full()
                         .cursor(CursorStyle::ResizeUpDown)
                         .bg(theme::border())
+                        .opacity(0.8)
                         .on_mouse_down(MouseButton::Left, cx.listener(move |workspace, event: &MouseDownEvent, _, cx| {
                             workspace.split_drag = Some(SplitDrag {
                                 id: split_id,
@@ -1151,6 +1232,7 @@ impl Render for Workspace {
             .tabs
             .get(self.active)
             .map(|tab| self.render_node(tab, &tab.root, tab.active_pane, cx));
+        let settings_menu = self.settings_open.then(|| deferred(self.render_settings_menu(cx)).with_priority(10));
         div()
             .key_context(actions::WORKSPACE)
             .track_focus(&self.focus_handle)
@@ -1190,6 +1272,7 @@ impl Render for Workspace {
             .flex_col()
             .bg(theme::bg())
             .text_color(theme::text())
+            .relative()
             .child(self.render_titlebar(cx))
             .child(
                 div()
@@ -1207,8 +1290,9 @@ impl Render for Workspace {
                             .min_h_0()
                             .children(terminal),
                     )
-                    .child(self.render_sidebar(window, cx)),
+                    .children(self.show_debug_bar.then(|| self.render_sidebar(window, cx).into_any_element())),
             )
+            .children(settings_menu)
     }
 }
 

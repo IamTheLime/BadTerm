@@ -871,14 +871,15 @@ impl PaintPlan {
         let cursor = grid.cursor.as_ref().map(|c| {
             let origin = point(cell_width * f32::from(c.col), line_height * f32::from(c.row));
             let cell = Bounds { origin, size: size(cell_width, line_height) };
+            let color = c.color.opacity(0.5);
             match c.shape {
-                CursorShape::Block => CursorPaint::Filled(cell, c.color),
-                CursorShape::Bar => CursorPaint::Filled(Bounds { origin, size: size(px(2.0), line_height) }, c.color),
+                CursorShape::Block => CursorPaint::Filled(cell, color),
+                CursorShape::Bar => CursorPaint::Filled(Bounds { origin, size: size(px(2.0), line_height) }, color),
                 CursorShape::Underline => CursorPaint::Filled(
                     Bounds { origin: point(origin.x, origin.y + line_height - px(2.0)), size: size(cell_width, px(2.0)) },
-                    c.color,
+                    color,
                 ),
-                CursorShape::Hollow => CursorPaint::Hollow(cell, c.color),
+                CursorShape::Hollow => CursorPaint::Hollow(cell, color),
             }
         });
 

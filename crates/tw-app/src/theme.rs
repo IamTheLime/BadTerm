@@ -2,6 +2,21 @@ use gpui::{Hsla, Rgba, rgb};
 use tw_scripting::HexColor;
 use tw_terminal::Rgb;
 
+/// UI palette selected from the settings menu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiTheme {
+    #[default]
+    AyuDark,
+}
+
+impl UiTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AyuDark => "Ayu Dark",
+        }
+    }
+}
+
 /// Used when installed; gpui falls back to the system monospace otherwise.
 pub const FONT_FAMILY: &str = "IosevkaTiago Nerd Font";
 pub const FONT_SIZE: f32 = 14.0;
@@ -14,43 +29,43 @@ pub fn hex(value: u32) -> Hsla {
 }
 
 pub fn bg() -> Hsla {
-    hex(0x14161c)
+    hex(0x0b0e14)
 }
 pub fn titlebar() -> Hsla {
-    hex(0x191c24)
+    hex(0x0f131a)
 }
 pub fn panel() -> Hsla {
-    hex(0x1b1e26)
+    hex(0x151a21)
 }
 pub fn raised() -> Hsla {
-    hex(0x2a2f3b)
+    hex(0x1f2430)
 }
 pub fn border() -> Hsla {
-    hex(0x2e3340)
+    hex(0x252b38)
 }
 pub fn text() -> Hsla {
-    hex(0xd6d9e0)
+    hex(0xbfbdb6)
 }
 pub fn muted() -> Hsla {
-    hex(0x8a90a0)
+    hex(0x626a73)
 }
 pub fn accent() -> Hsla {
-    hex(0x7aa2f7)
+    hex(0x59c2ff)
 }
 pub fn error() -> Hsla {
-    hex(0xf7768e)
+    hex(0xf07178)
 }
 pub fn warn() -> Hsla {
-    hex(0xe0af68)
+    hex(0xffb454)
 }
 pub fn button() -> Hsla {
-    hex(0x33405e)
+    hex(0x1b3a4b)
 }
 pub fn button_hover() -> Hsla {
-    hex(0x40507a)
+    hex(0x244d63)
 }
 pub fn code_bg() -> Hsla {
-    hex(0x0f1116)
+    hex(0x0b0e14)
 }
 
 /// The terminal's own colours, resolved by libghostty.
